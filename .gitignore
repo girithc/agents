@@ -6,3 +6,6 @@
 *.db-shm
 master.key
 .DS_Store
+
+# local secrets
+.env

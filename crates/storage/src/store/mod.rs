@@ -7,7 +7,8 @@ use crate::db::Db;
 use crate::vault::Vault;
 
 mod agents;
-mod runs;
+pub mod agent;
+pub mod environment;
 mod secrets;
 pub mod traces;
 

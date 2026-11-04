@@ -21,7 +21,6 @@ CREATE TABLE IF NOT EXISTS agents (
     max_output_tokens INTEGER NOT NULL DEFAULT 4096,
     max_iterations    INTEGER NOT NULL DEFAULT 6,
     reasoning_effort  TEXT NOT NULL DEFAULT 'medium',
-    memory_enabled    INTEGER NOT NULL DEFAULT 1,
     version           INTEGER NOT NULL DEFAULT 1,
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL
@@ -36,33 +35,6 @@ CREATE TABLE IF NOT EXISTS agent_versions (
     created_at    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agent_versions_agent ON agent_versions(agent_id);
-
-CREATE TABLE IF NOT EXISTS runs (
-    id            TEXT PRIMARY KEY,
-    agent_id      TEXT NOT NULL,
-    agent_version INTEGER NOT NULL,
-    kind          TEXT NOT NULL DEFAULT 'regular',
-    request_id    TEXT,
-    status        TEXT NOT NULL DEFAULT 'running',
-    input         TEXT NOT NULL,
-    output        TEXT,
-    error         TEXT,
-    provider      TEXT NOT NULL,
-    model         TEXT NOT NULL,
-    iterations    INTEGER NOT NULL DEFAULT 0,
-    started_at    INTEGER NOT NULL,
-    finished_at   INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_runs_agent ON runs(agent_id);
-
-CREATE TABLE IF NOT EXISTS run_messages (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id     TEXT NOT NULL,
-    role       TEXT NOT NULL,
-    content    TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_run_messages_run ON run_messages(run_id);
 
 CREATE TABLE IF NOT EXISTS feedback (
     id         TEXT PRIMARY KEY,
@@ -102,6 +74,100 @@ CREATE TABLE IF NOT EXISTS trace_events (
     ts       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_trace_events_run ON trace_events(run_id);
+
+-- ------------------------------------------------------------- agent process
+-- Long-horizon agent state. All of it lives in the DB so an agent's loop
+-- task can die and be respawned without losing anything.
+
+CREATE TABLE IF NOT EXISTS soul (
+    agent_id   TEXT PRIMARY KEY,
+    soul       TEXT NOT NULL DEFAULT '',
+    goal       TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_state (
+    agent_id     TEXT PRIMARY KEY,
+    status       TEXT NOT NULL DEFAULT 'idle',
+    current_task TEXT,
+    next_wake_at INTEGER,
+    updated_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_tasks (
+    id         TEXT PRIMARY KEY,
+    agent_id   TEXT NOT NULL,
+    title      TEXT NOT NULL,
+    body       TEXT NOT NULL DEFAULT '',
+    status     TEXT NOT NULL DEFAULT 'queued',
+    created_at INTEGER NOT NULL,
+    done_at    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_agent ON agent_tasks(agent_id, status);
+
+CREATE TABLE IF NOT EXISTS agent_memory (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id   TEXT NOT NULL,
+    kind       TEXT NOT NULL DEFAULT 'event',
+    content    TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_memory_agent ON agent_memory(agent_id);
+
+CREATE TABLE IF NOT EXISTS tools (
+    id         TEXT PRIMARY KEY,
+    kind       TEXT NOT NULL DEFAULT 'builtin',
+    config     TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_tools (
+    agent_id TEXT NOT NULL,
+    tool_id  TEXT NOT NULL,
+    PRIMARY KEY (agent_id, tool_id)
+);
+
+-- ------------------------------------------------------------- environment
+-- The governing world agents live in: cadence, rules (global + per-agent),
+-- and a read-only shared board of live facts (inventory, cash, ...).
+
+CREATE TABLE IF NOT EXISTS environment (
+    id               TEXT PRIMARY KEY,
+    name             TEXT NOT NULL UNIQUE,
+    tick_interval_ms INTEGER NOT NULL DEFAULT 30000,
+    created_at       INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS environment_rules (
+    id             TEXT PRIMARY KEY,
+    environment_id TEXT NOT NULL,
+    agent_id       TEXT,
+    rule           TEXT NOT NULL,
+    created_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_env_rules_env ON environment_rules(environment_id);
+CREATE INDEX IF NOT EXISTS idx_env_rules_agent ON environment_rules(agent_id);
+
+CREATE TABLE IF NOT EXISTS environment_state (
+    environment_id TEXT NOT NULL,
+    key            TEXT NOT NULL,
+    value          TEXT NOT NULL DEFAULT '{}',
+    updated_at     INTEGER NOT NULL,
+    PRIMARY KEY (environment_id, key)
+);
+
+-- The ledger: one append-only row per world mutation (deal, sale, listing,
+-- rule change, ...). Item statuses on the board are a projection of this.
+CREATE TABLE IF NOT EXISTS environment_changes (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    environment_id TEXT NOT NULL,
+    actor          TEXT,
+    kind           TEXT NOT NULL,
+    payload        TEXT NOT NULL DEFAULT '{}',
+    created_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_env_changes_env ON environment_changes(environment_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_env_changes_kind ON environment_changes(environment_id, kind);
 "#;
 
 #[derive(Clone)]
@@ -121,50 +187,18 @@ impl Db {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         Self::migrate_trace_tables(&conn)?;
-        Self::migrate_runs_columns(&conn)?;
-        Self::migrate_agents_columns(&conn)?;
+        Self::drop_orphaned_tables(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
     }
 
-    /// Older databases lack the `agents.memory_enabled` column; add it.
-    /// (runs.kind / runs.request_id / trace tables have their own migrations.)
-    fn migrate_agents_columns(conn: &Connection) -> Result<()> {
-        let mut stmt = conn.prepare("PRAGMA table_info(agents)")?;
-        let cols: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
-
-        if !cols.iter().any(|c| c == "memory_enabled") {
-            tracing::warn!("migrating agents table: adding 'memory_enabled' column");
-            conn.execute_batch(
-                "ALTER TABLE agents ADD COLUMN memory_enabled INTEGER NOT NULL DEFAULT 1",
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Older databases lack the `runs.kind` / `runs.request_id` columns;
-    /// add them in place.
-    fn migrate_runs_columns(conn: &Connection) -> Result<()> {
-        let mut stmt = conn.prepare("PRAGMA table_info(runs)")?;
-        let cols: Vec<String> = stmt
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
-
-        if !cols.iter().any(|c| c == "kind") {
-            tracing::warn!("migrating runs table: adding 'kind' column");
-            conn.execute_batch(
-                "ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'regular'",
-            )?;
-        }
-        if !cols.iter().any(|c| c == "request_id") {
-            tracing::warn!("migrating runs table: adding 'request_id' column");
-            conn.execute_batch("ALTER TABLE runs ADD COLUMN request_id TEXT")?;
-        }
+    /// The one-shot run engine was removed; its tables are orphaned.
+    fn drop_orphaned_tables(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS run_messages;
+             DROP TABLE IF EXISTS runs;",
+        )?;
         Ok(())
     }
 

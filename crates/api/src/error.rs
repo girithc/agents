@@ -48,24 +48,6 @@ impl From<agenthub_providers::ProviderError> for ApiError {
     }
 }
 
-impl From<agenthub_runtime::RuntimeError> for ApiError {
-    fn from(e: agenthub_runtime::RuntimeError) -> Self {
-        match e {
-            agenthub_runtime::RuntimeError::MissingSecret(name) => Self::unavailable(format!(
-                "missing secret '{name}' — set it via `agentctl secret set {name}` \
-                 or PUT /v1/secrets/{name}"
-            )),
-            agenthub_runtime::RuntimeError::Provider(pe) => match pe {
-                agenthub_providers::ProviderError::Unknown(_, names) => Self::bad_request(format!(
-                    "unknown provider; registered: {names:?}"
-                )),
-                other => Self::bad_request(format!("provider error: {other}")),
-            },
-            other => Self::bad_request(other.to_string()),
-        }
-    }
-}
-
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {}", self.status, self.message)

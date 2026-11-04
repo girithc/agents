@@ -1,7 +1,8 @@
 //! HTTP API for the agent platform.
 //!
-//! Layering: `api` → `runtime` → `providers`, with `storage` shared by
-//! `api` and `runtime`. The web UI (later) will consume the same routes.
+//! Layering: `api` → `storage` (the loop engine lives in `runtime` and will
+//! be wired into these routes as it grows). The web UI (later) will consume
+//! the same routes.
 
 pub mod error;
 pub mod middleware;
@@ -11,10 +12,6 @@ pub mod state;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agenthub_providers::meta::MetaProvider;
-use agenthub_providers::mock::MockProvider;
-use agenthub_providers::registry::Registry;
-use agenthub_runtime::Runtime;
 use agenthub_storage::{Store, Vault};
 use axum::Router;
 use tower_http::cors::CorsLayer;
@@ -30,25 +27,18 @@ pub struct ServeConfig {
     pub data_dir: PathBuf,
 }
 
-/// Build the full application state (storage, provider registry, runtime).
+/// Build the full application state (storage).
 pub fn build_state(data_dir: &PathBuf) -> anyhow::Result<Arc<AppState>> {
     std::fs::create_dir_all(data_dir)?;
     let vault = Vault::open(&data_dir.join("master.key"))?;
     let store = Arc::new(Store::open(&data_dir.join("agenthub.db"), vault)?);
-
-    let registry = Registry::new();
-    registry.register(Arc::new(MetaProvider::new(None)));
-    registry.register(Arc::new(MockProvider::new()));
-
-    let runtime = Runtime::new(store.clone(), Arc::new(registry));
-    Ok(Arc::new(AppState::new(store, Arc::new(runtime))))
+    Ok(Arc::new(AppState::new(store)))
 }
 
 /// Build the axum router for the given state.
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(routes::agents::router())
-        .merge(routes::runs::router())
         .merge(routes::secrets::router())
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .layer(axum::middleware::from_fn(middleware::middleware))
@@ -67,7 +57,6 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(
         %addr,
-        providers = ?state.registry_names(),
         data_dir = %cfg.data_dir.display(),
         "agenthub api listening"
     );

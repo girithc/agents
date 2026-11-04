@@ -16,7 +16,6 @@
 //! Adding a provider = add a module + implement [`Provider`] + register it.
 
 pub mod meta;
-pub mod mock;
 pub mod registry;
 
 use async_trait::async_trait;

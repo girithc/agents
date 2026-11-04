@@ -14,8 +14,6 @@ pub struct Agent {
     pub max_output_tokens: i64,
     pub max_iterations: i64,
     pub reasoning_effort: String,
-    /// Whether the agent uses long-term memory (recall + auto-extraction).
-    pub memory_enabled: bool,
     pub version: i64,
     pub created_at: i64,
     pub updated_at: i64,
@@ -37,12 +35,6 @@ pub struct NewAgent {
     pub max_iterations: i64,
     #[serde(default = "default_reasoning_effort")]
     pub reasoning_effort: String,
-    #[serde(default = "default_memory_enabled")]
-    pub memory_enabled: bool,
-}
-
-fn default_memory_enabled() -> bool {
-    true
 }
 
 fn default_provider() -> String {
@@ -74,7 +66,6 @@ pub struct AgentUpdate {
     pub max_output_tokens: Option<i64>,
     pub max_iterations: Option<i64>,
     pub reasoning_effort: Option<String>,
-    pub memory_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,72 +75,6 @@ pub struct AgentVersion {
     pub version: i64,
     pub system_prompt: String,
     pub note: Option<String>,
-    pub created_at: i64,
-}
-
-// ---------------------------------------------------------------- runs
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunKind {
-    /// A normal agent run (user input -> response).
-    Regular,
-    /// A feedback-loop improvement of the agent's system prompt.
-    Improve,
-}
-
-impl RunKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            RunKind::Regular => "regular",
-            RunKind::Improve => "improve",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunStatus {
-    Running,
-    Succeeded,
-    Failed,
-}
-
-impl RunStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            RunStatus::Running => "running",
-            RunStatus::Succeeded => "succeeded",
-            RunStatus::Failed => "failed",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Run {
-    pub id: String,
-    pub agent_id: String,
-    pub agent_version: i64,
-    pub kind: RunKind,
-    /// HTTP request that originated this run (`x-request-id`).
-    pub request_id: Option<String>,
-    pub status: RunStatus,
-    pub input: String,
-    pub output: Option<String>,
-    pub error: Option<String>,
-    pub provider: String,
-    pub model: String,
-    pub iterations: i64,
-    pub started_at: i64,
-    pub finished_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunMessage {
-    pub id: i64,
-    pub run_id: String,
-    pub role: String,
-    pub content: String,
     pub created_at: i64,
 }
 

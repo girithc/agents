@@ -4,17 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-agenthub-storage.workspace = true
-agenthub-providers.workspace = true
-
-async-trait.workspace = true
-futures.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-uuid.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
+agenthub-storage = { path = "../storage" }
+agenthub-telemetry = { path = "../telemetry" }
+agenthub-providers = { path = "../providers" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+futures = { workspace = true }

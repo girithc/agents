@@ -42,7 +42,6 @@ name = "agenthub-api"
 version = "0.1.0"
 dependencies = [
  "agenthub-providers",
- "agenthub-runtime",
  "agenthub-storage",
  "agenthub-telemetry",
  "anyhow",
@@ -95,14 +94,28 @@ version = "0.1.0"
 dependencies = [
  "agenthub-providers",
  "agenthub-storage",
+ "agenthub-telemetry",
  "async-trait",
  "futures",
- "serde",
  "serde_json",
- "tempfile",
- "thiserror",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "agenthub-scenes"
+version = "0.1.0"
+dependencies = [
+ "agenthub-providers",
+ "agenthub-runtime",
+ "agenthub-storage",
+ "async-trait",
+ "futures",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

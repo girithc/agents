@@ -1,4 +1,4 @@
-//! Persistent storage for agents, runs, secrets, feedback, and traces.
+//! Persistent storage for agents, environments, secrets, feedback, and traces.
 //!
 //! SQLite (WAL mode) is the single source of truth; secret values are
 //! encrypted at rest with AES-256-GCM via [`crate::vault::Vault`].
@@ -13,8 +13,8 @@ pub mod models;
 pub use db::Db;
 pub use error::{Result, StorageError};
 pub use models::{
-    Agent, AgentUpdate, AgentVersion, Feedback, FeedbackSummary, NewAgent, Run, RunKind,
-    RunMessage, RunStatus, SecretMeta, TraceEvent, TraceSpan,
+    Agent, AgentUpdate, AgentVersion, Feedback, FeedbackSummary, NewAgent, SecretMeta, TraceEvent,
+    TraceSpan,
 };
 pub use store::Store;
 pub use vault::Vault;

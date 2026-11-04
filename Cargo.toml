@@ -7,6 +7,7 @@ members = [
     "crates/runtime",
     "crates/storage",
     "crates/telemetry",
+    "crates/scenes",
 ]
 
 [workspace.package]
