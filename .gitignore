@@ -1,0 +1,8 @@
+/target
+/.cargo-home
+/data
+*.db
+*.db-wal
+*.db-shm
+master.key
+.DS_Store
