@@ -68,6 +68,9 @@ impl AgentHandle {
 pub fn spawn_agent_loop(deps: AgentDeps, brain: Arc<dyn Brain>) -> AgentHandle {
     let agent_id = deps.agent_id.clone();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    // List this agent in the phonebook so board changes can knock it awake
+    // instantly instead of waiting for the next tick.
+    deps.env.phonebook().register(&agent_id, tx.clone());
     let join = tokio::spawn(run(deps, brain, rx));
     AgentHandle {
         agent_id,
@@ -84,9 +87,10 @@ async fn run(
     let AgentDeps { store, env, agent_id } = deps;
     let tools = AgentTools::new(store.clone(), env.clone(), agent_id.clone()).await;
     let who = tools.agent_name().to_string();
+    let model = tools.agent_model().to_string();
 
     let _ = store.set_state(&agent_id, AgentStatus::Idle, None, None).await;
-    tracing::info!(agent = %who, "{who} starts working");
+    tracing::info!(agent = %who, model = %model, "starts working");
 
     // The agent is always either thinking or sleeping. `sleep_until` is the
     // current sleep's deadline; mail can interrupt any sleep.
@@ -126,7 +130,7 @@ async fn run(
                 match mail {
                     None | Some(Mail::Stop) => break,
                     Some(Mail::Task(_)) => {
-                        tracing::info!(agent = %who, "{who} got a task hint");
+                        tracing::info!(agent = %who, model = %model, "got a task hint");
                         let _ = store.set_state(&agent_id, AgentStatus::Idle, None, None).await;
                         while let Some(task) = pop(&store, &agent_id).await {
                             let out = run_task(&store, brain.as_ref(), &tools, &env, &task).await;
@@ -134,7 +138,7 @@ async fn run(
                         }
                     }
                     Some(Mail::Message { from, body }) => {
-                        tracing::info!(agent = %who, "{who} got a message from {from}");
+                        tracing::info!(agent = %who, model = %model, "got a message from {from}");
                         let _ = store.remember(
                             &agent_id,
                             MemoryKind::Event,
@@ -184,7 +188,8 @@ async fn run(
     }
 
     let _ = store.set_state(&agent_id, AgentStatus::Stopped, None, None).await;
-    tracing::info!(agent = %who, "{who} stopped");
+    env.phonebook().remove(&agent_id); // delist: no more knocks
+    tracing::info!(agent = %who, model = %model, "stopped");
 }
 
 async fn pop(store: &Arc<Store>, agent_id: &str) -> Option<AgentTask> {
@@ -231,7 +236,13 @@ async fn run_task(
         } else {
             note
         };
-        tracing::info!(agent = %tools.agent_name(), "finished: {note}");
+        tracing::info!(
+            agent = %tools.agent_name(),
+            model = %tools.agent_model(),
+            kind = "finished",
+            thought = %note,
+            "finished"
+        );
         out
     }
     .instrument(span)

@@ -9,6 +9,7 @@
 pub mod brain;
 pub mod env;
 pub mod llm_brain;
+pub mod phonebook;
 pub mod process;
 pub mod scene;
 pub mod supervisor;
@@ -18,6 +19,7 @@ mod tests;
 pub use brain::{AgentTools, Brain, ThinkCtx, ThinkOutcome};
 pub use env::EnvHandle;
 pub use llm_brain::{dispatch_tool, tool_specs, LlmBrain};
+pub use phonebook::Phonebook;
 pub use process::{spawn_agent_loop, AgentDeps, AgentHandle, Mail};
 pub use scene::{DomainCtx, DomainTool, Scene, SceneWorld};
 pub use supervisor::Supervisor;

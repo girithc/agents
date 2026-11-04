@@ -1,5 +1,6 @@
 /target
 /.cargo-home
+/vendor
 /data
 *.db
 *.db-wal
@@ -9,3 +10,6 @@ master.key
 
 # local secrets
 .env
+
+# stray logs
+*.err

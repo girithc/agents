@@ -14,6 +14,7 @@ const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS agents (
     id                TEXT PRIMARY KEY,
     name              TEXT NOT NULL UNIQUE,
+    role              TEXT NOT NULL DEFAULT '',
     system_prompt     TEXT NOT NULL,
     provider          TEXT NOT NULL DEFAULT 'meta',
     model             TEXT NOT NULL DEFAULT 'muse-spark-1.3-contributor',
@@ -127,6 +128,16 @@ CREATE TABLE IF NOT EXISTS agent_tools (
     PRIMARY KEY (agent_id, tool_id)
 );
 
+-- Pub/sub: which board keys each agent chose to follow. Explicit only —
+-- touching a key is not following it; the agent must decide.
+CREATE TABLE IF NOT EXISTS subscriptions (
+    agent_id   TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_key ON subscriptions(key);
+
 -- ------------------------------------------------------------- environment
 -- The governing world agents live in: cadence, rules (global + per-agent),
 -- and a read-only shared board of live facts (inventory, cash, ...).
@@ -187,6 +198,9 @@ impl Db {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         Self::migrate_trace_tables(&conn)?;
+        // Databases created before agents had a role: add the column. A
+        // duplicate-column error means it's already there — fine.
+        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN role TEXT NOT NULL DEFAULT ''");
         Self::drop_orphaned_tables(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

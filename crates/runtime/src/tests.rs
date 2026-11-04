@@ -45,6 +45,7 @@ async fn agent_row(s: &Store, name: &str, provider: &str) -> String {
     let a = s
         .create_agent(NewAgent {
             name: name.to_string(),
+            role: "test".into(),
             system_prompt: "you are a test agent".into(),
             provider: provider.into(),
             model: "muse-spark-1.3-contributor".into(),

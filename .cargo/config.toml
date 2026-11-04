@@ -1,0 +1,8 @@
+# Use the vendored copies in ./vendor instead of the network registry.
+# One shared source path for every machine/user → fingerprints stay valid,
+# builds never re-download, and no ~/.cargo access is needed.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

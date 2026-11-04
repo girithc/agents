@@ -91,6 +91,17 @@ impl LlmBrain {
             for call in &resp.tool_calls {
                 let result = dispatch_tool(call, tools, domain).await;
                 tracing::debug!(agent = %tools.agent_id(), tool = %call.name, "tool result: {result}");
+                // One governance line per tool use: who[model] did what[why].
+                // The reasoning summary is the model's stated "why" this round.
+                let said = friendly_line(call, &result);
+                let thought = resp.reasoning.clone().unwrap_or_default();
+                tracing::info!(
+                    agent = %tools.agent_name(),
+                    model = %req.model,
+                    kind = "action",
+                    thought = %thought,
+                    "{said}"
+                );
                 messages.push(ChatMessage::tool(call.id.clone(), result));
 
                 // `sleep` is terminal: going to sleep ends the turn —
@@ -160,13 +171,46 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             ),
         },
         ToolSpec {
-            name: "board_read".into(),
-            description: "Read the shared environment board (inventory, cash, ...). \
-                          Omit 'key' to read the whole board."
+            name: "talk_to".into(),
+            description: "Speak with another agent by name — greet them, ask what they \
+                          have or what they want, negotiate, say anything. Your words \
+                          land in their inbox and wake them; they reply with their own \
+                          talk_to. This is how the world runs: conversation."
+                .into(),
+            parameters: obj(
+                json!({
+                    "who": { "type": "string", "description": "agent name (see who_is_here)" },
+                    "what": { "type": "string", "description": "what you say" }
+                }),
+                &["who", "what"],
+            ),
+        },
+        ToolSpec {
+            name: "who_is_here".into(),
+            description: "The roster of this world: every agent's name and role. \
+                          Names and roles only — never anyone's inventory or prices."
+                .into(),
+            parameters: obj(json!({}), &[]),
+        },
+        ToolSpec {
+            name: "subscribe".into(),
+            description: "Follow a board key: every future change to it is delivered \
+                          to your inbox and wakes you (including changes you cause \
+                          yourself). Subscribe only to things you must follow up on — \
+                          casual reads don't need a subscription."
+                .into(),
+            parameters: obj(
+                json!({ "key": { "type": "string", "description": "board key, e.g. item:watch" } }),
+                &["key"],
+            ),
+        },
+        ToolSpec {
+            name: "unsubscribe".into(),
+            description: "Stop following a board key — no more notifications from it."
                 .into(),
             parameters: obj(
                 json!({ "key": { "type": "string" } }),
-                &[],
+                &["key"],
             ),
         },
         ToolSpec {
@@ -242,15 +286,40 @@ pub async fn dispatch_tool(
             }
             None => Err("missing 'task_id'".to_string()),
         }
-        "board_read" => match arg_str(&args, "key") {
+        "talk_to" => match (arg_str(&args, "who"), arg_str(&args, "what")) {
+            (Some(who), Some(what)) => match tools.talk_to(&who, &what).await {
+                Ok(()) => Ok(json!({ "ok": true, "to": who })),
+                Err(e) => Err(e),
+            },
+            (None, _) => Err("missing 'who'".into()),
+            (_, None) => Err("missing 'what'".into()),
+        },
+        "who_is_here" => {
+            let roster = tools
+                .directory()
+                .await
+                .into_iter()
+                .map(|(name, role)| json!({ "name": name, "role": role }))
+                .collect::<Vec<_>>();
+            Ok(json!(roster))
+        }
+        "subscribe" => match arg_str(&args, "key") {
             Some(key) => {
-                let v = tools.board_get(&key).await;
-                Ok(json!({ "key": key, "value": v }))
+                tools.subscribe(&key).await;
+                // The result carries the key's current state so the agent
+                // starts its follow-up from the present, not from a stale
+                // prompt picture.
+                let current = tools.board_get(&key).await;
+                Ok(json!({ "ok": true, "following": key, "current": current }))
             }
-            None => {
-                let snap = tools.board_snapshot().await;
-                Ok(json!(snap.into_iter().collect::<std::collections::BTreeMap<_, _>>()))
+            None => Err("missing 'key'".into()),
+        },
+        "unsubscribe" => match arg_str(&args, "key") {
+            Some(key) => {
+                tools.unsubscribe(&key).await;
+                Ok(json!({ "ok": true, "following": null }))
             }
+            None => Err("missing 'key'".into()),
         },
         "sleep" => {
             let secs = args.get("seconds").and_then(Value::as_f64).unwrap_or(0.0);
@@ -267,9 +336,6 @@ pub async fn dispatch_tool(
         Ok(v) => v.to_string(),
         Err(e) => json!({ "error": e }).to_string(),
     };
-    // One plain-words line per tool use — the story of what happened.
-    let said = friendly_line(call, &out);
-    tracing::info!(agent = %tools.agent_name(), kind = "action", "{} {said}", tools.agent_name());
     out
 }
 
@@ -288,6 +354,17 @@ fn friendly_line(call: &ToolCall, out: &str) -> String {
         "todo_add" => format!("added a task to their list{err}"),
         "todo_finish" => format!("ticked off a task{err}"),
         "board_read" => format!("looked at the board{err}"),
+        "talk_to" => format!(
+            "spoke with {}{err}",
+            v.get("to").and_then(Value::as_str).unwrap_or("someone")
+        ),
+        "who_is_here" => format!("looked at the roster{err}"),
+        "subscribe" => format!(
+            "started following {}{err}",
+            v.get("following").and_then(Value::as_str).unwrap_or("a key")
+        ),
+        "unsubscribe" => format!("stopped following {}{err}",
+            v.get("following").and_then(Value::as_str).unwrap_or("a key")),
         "sleep" => format!("went to sleep{err}"),
         other => format!("used {other}{err}"),
     }

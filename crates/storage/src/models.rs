@@ -7,6 +7,9 @@ use serde_json::Value;
 pub struct Agent {
     pub id: String,
     pub name: String,
+    /// What this agent is in the world (the roster shows it); never what
+    /// it owns or at what price — that's private.
+    pub role: String,
     pub system_prompt: String,
     pub provider: String,
     pub model: String,
@@ -22,6 +25,8 @@ pub struct Agent {
 #[derive(Debug, Clone, Deserialize)]
 pub struct NewAgent {
     pub name: String,
+    #[serde(default)]
+    pub role: String,
     pub system_prompt: String,
     #[serde(default = "default_provider")]
     pub provider: String,
@@ -59,6 +64,7 @@ fn default_reasoning_effort() -> String {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AgentUpdate {
     pub name: Option<String>,
+    pub role: Option<String>,
     pub system_prompt: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,

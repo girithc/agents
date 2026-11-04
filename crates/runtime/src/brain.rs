@@ -4,6 +4,8 @@
 use agenthub_storage::store::agent::AgentTask;
 use async_trait::async_trait;
 
+use crate::process::Mail;
+
 /// Everything the brain sees for one think: who it is, what it wants,
 /// the rules, its to-do, and the departures board.
 pub struct ThinkCtx {
@@ -28,6 +30,8 @@ pub struct AgentTools {
     agent_id: String,
     /// Display name for human-readable logs.
     name: String,
+    /// Model id for human-readable governance logs.
+    model: String,
     /// Sleep requested by the brain during this think (via the sleep tool).
     sleep_request: std::sync::Mutex<Option<u64>>,
 }
@@ -39,18 +43,16 @@ impl AgentTools {
         agent_id: impl Into<String>,
     ) -> Self {
         let agent_id = agent_id.into();
-        let name = store
-            .get_agent(&agent_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|a| a.name)
-            .unwrap_or_else(|| agent_id.clone());
+        let (name, model) = match store.get_agent(&agent_id).await.ok().flatten() {
+            Some(a) => (a.name, a.model),
+            None => (agent_id.clone(), "unknown".to_string()),
+        };
         Self {
             store,
             env,
             agent_id,
             name,
+            model,
             sleep_request: std::sync::Mutex::new(None),
         }
     }
@@ -62,6 +64,11 @@ impl AgentTools {
     /// Human-readable name (falls back to the id).
     pub fn agent_name(&self) -> &str {
         &self.name
+    }
+
+    /// Model id backing this agent (falls back to "unknown").
+    pub fn agent_model(&self) -> &str {
+        &self.model
     }
 
     /// For the domain-tool layer: direct store + env access.
@@ -121,6 +128,52 @@ impl AgentTools {
 
     pub async fn board_snapshot(&self) -> Vec<(String, serde_json::Value)> {
         self.env.board_snapshot().await
+    }
+
+    /// Follow a board key: every future change to it lands in this agent's
+    /// inbox and wakes it. The agent's explicit choice — touching a key is
+    /// not following it.
+    pub async fn subscribe(&self, key: &str) {
+        let _ = self.store.subscribe(&self.agent_id, key).await;
+    }
+
+    /// Stop following a board key.
+    pub async fn unsubscribe(&self, key: &str) {
+        let _ = self.store.unsubscribe(&self.agent_id, key).await;
+    }
+
+    /// Speak with another agent: your words land in their inbox (durable,
+    /// readable later) and a knock wakes them this instant if they're live.
+    /// This is how the world runs — conversation, not boards.
+    pub async fn talk_to(&self, who: &str, what: &str) -> Result<(), String> {
+        let other = self
+            .store
+            .get_agent(who)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no agent '{who}'"))?;
+        if other.id == self.agent_id {
+            return Err("that's you — talk_to someone else".into());
+        }
+        let task = self
+            .store
+            .enqueue_task(&other.id, &format!("message from {}", self.name), what)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.env.phonebook().knock(&other.id, Mail::Task(task.id));
+        Ok(())
+    }
+
+    /// The roster: who exists in this world, by name and role. Names and
+    /// roles only — never anyone's inventory, budget, or prices.
+    pub async fn directory(&self) -> Vec<(String, String)> {
+        self.store
+            .list_agents()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| (a.name, a.role))
+            .collect()
     }
 }
 

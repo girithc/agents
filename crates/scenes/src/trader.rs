@@ -1,9 +1,13 @@
-//! Trader scene: one buyer, one seller, one item. Negotiation happens
-//! agent-to-agent; the world only records rules, item status, and deals.
+//! Trader scene: one buyer, one seller, one item — a thin implementation
+//! of the base. The world runs through **conversation**: the buyer finds
+//! the seller on the roster, approaches them (`talk_to`), they negotiate,
+//! and `send_offer`/`accept_deal` are the binding handshake both sides
+//! must use to close (the ledger is the truth).
 //!
-//! Board keys: `item:{name}` → { "status": "available"|"pending"|"sold",
-//! "last_price": number|null }. Offers never touch the board — they travel
-//! agent-to-agent as tasks, and every mutation lands in the ledger.
+//! Ownership is private: the seller *possesses* the watch (its soul and
+//! memory carry that), and the buyer's budget lives only in the buyer.
+//! The board is a projection for **human auditing** of item status —
+//! never read by agents, never announced to them.
 
 use std::sync::Arc;
 
@@ -13,6 +17,8 @@ use agenthub_storage::{NewAgent, Store};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+/// The item this world trades. Public so tests and humans can reference it;
+/// agents know it from their souls, never from a board.
 pub const ITEM: &str = "watch";
 const BUYER: &str = "buyer";
 const SELLER: &str = "seller";
@@ -137,10 +143,17 @@ impl DomainTool for AcceptDeal {
             .await
             .map_err(|e| e.to_string())?;
 
-        // Board projection: item is gone.
+        // Board projection: item is gone. This write announces the sale to
+        // the item's subscribers (e.g. waking the buyer to go take it).
         ctx.env
             .set_board(&format!("item:{item}"), &json!({ "status": "sold", "last_price": price }))
             .await;
+
+        // A closed deal ends the follow-up: both parties drop their
+        // subscription — the announcement above was already delivered.
+        let item_key = format!("item:{item}");
+        let _ = ctx.store.unsubscribe(&ctx.actor, &item_key).await;
+        let _ = ctx.store.unsubscribe(&other.id, &item_key).await;
 
         // Notify the counterpart (their loop will think + settle).
         ctx.store
@@ -185,19 +198,34 @@ impl Scene for TraderScene {
             .await
             .map_err(|e| e.to_string())?;
 
-        // Roster: souls carry the private constraints (budget / floor).
-        let buyer = agent(store, BUYER, "You are a buyer. You have a budget of $100. \
-             Get the item as cheap as possible, but a fair deal today beats no deal.")
-            .await?;
-        let seller = agent(store, SELLER, "You are a seller. You must clear at least $70 for the item. \
-             Squeeze the best price, but close the deal today.")
-            .await?;
+        // Roster: souls carry the private facts (who owns what, budget,
+        // floor). Nothing is placed on the public board — the seller owns
+        // the watch, the buyer wants one, and they find each other through
+        // the roster and conversation.
+        let buyer = agent(
+            store,
+            BUYER,
+            "buyer",
+            "You are a buyer. You want to buy a watch. You have a budget of $100 — \
+             get it as cheap as possible, but a fair deal today beats no deal. \
+             Check who_is_here, find someone who sells, and approach them with \
+             talk_to: greet them, ask what they have, negotiate. Close with the \
+             send_offer/accept_deal handshake.",
+        )
+        .await?;
+        let seller = agent(
+            store,
+            SELLER,
+            "seller",
+            "You are a seller. You own a watch — remember it; it is yours to sell. \
+             You must clear at least $70, squeeze the best price, and close today. \
+             Entertain buyers who approach you (talk_to). If no one approaches, go \
+             look for buyers: check who_is_here and approach them with a pitch. \
+             Close with the send_offer/accept_deal handshake.",
+        )
+        .await?;
 
-        // Catalog.
-        store
-            .set_env_state(&env.id, &format!("item:{ITEM}"), &json!({"status": "available", "last_price": null}).to_string())
-            .await
-            .map_err(|e| e.to_string())?;
+        let env = agenthub_runtime::EnvHandle::new(store.clone(), env.id);
 
         // Verbs: register + grant to both roles.
         for t in [&SendOffer as &dyn DomainTool, &AcceptDeal as &dyn DomainTool] {
@@ -211,32 +239,8 @@ impl Scene for TraderScene {
             }
         }
 
-        // Seeds: they name the counterpart, so each side knows who to talk to.
-        store
-            .enqueue_task(
-                &buyer,
-                "buy the watch",
-                "The watch is on the board. The seller agent is named 'seller'. \
-                 Your FIRST action must be send_offer(to: \"seller\", item: \"watch\", \
-                 price: <your opening offer>) — do not sleep or wait instead. \
-                 Your budget is $100; keep countering until a deal is closed with \
-                 accept_deal (then remember it) or you choose to walk away.",
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        store
-            .enqueue_task(
-                &seller,
-                "sell the watch",
-                "You hold the watch. The buyer agent is named 'buyer' — they will send \
-                 you offers as tasks; respond with send_offer (counter) or accept_deal \
-                 (close). You need at least $70.",
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-
         Ok(SceneWorld {
-            env: agenthub_runtime::EnvHandle::new(store.clone(), env.id),
+            env,
             agents: vec![buyer, seller],
         })
     }
@@ -246,10 +250,11 @@ impl Scene for TraderScene {
     }
 }
 
-async fn agent(store: &Arc<Store>, name: &str, soul: &str) -> Result<String, String> {
+async fn agent(store: &Arc<Store>, name: &str, role: &str, soul: &str) -> Result<String, String> {
     let a = store
         .create_agent(NewAgent {
             name: name.to_string(),
+            role: role.to_string(),
             system_prompt: soul.to_string(),
             provider: "meta".into(),
             model: "muse-spark-1.3-contributor".into(),

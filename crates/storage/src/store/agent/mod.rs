@@ -3,6 +3,7 @@
 pub mod memory;
 pub mod soul;
 pub mod state;
+pub mod subscriptions;
 pub mod tasks;
 pub mod tools;
 

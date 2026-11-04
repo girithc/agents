@@ -34,6 +34,8 @@ pub(crate) async fn find_agent(st: &AppState, id_or_name: &str) -> ApiResult<Age
 #[derive(Deserialize)]
 pub struct CreateAgentBody {
     pub name: String,
+    #[serde(default)]
+    pub role: String,
     pub system_prompt: String,
     #[serde(default = "d_provider")]
     pub provider: String,
@@ -60,6 +62,7 @@ impl From<CreateAgentBody> for NewAgent {
     fn from(b: CreateAgentBody) -> Self {
         NewAgent {
             name: b.name,
+            role: b.role,
             system_prompt: b.system_prompt,
             provider: b.provider,
             model: b.model,

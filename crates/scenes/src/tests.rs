@@ -38,13 +38,24 @@ async fn scene_setup_is_complete() {
     let specs: Vec<_> = scene.domain_tools().iter().map(|t| t.spec().name).collect();
     assert_eq!(specs, vec!["send_offer", "accept_deal"]);
 
-    // Catalog on the board, rules in the world, seeds queued.
-    assert_eq!(world.env.board_get("item:watch").await.unwrap()["status"], "available");
+    // Nothing is public at setup: no item on the board (the seller owns
+    // it privately), no seeded tasks (the roster + souls drive first
+    // contact), and the roster carries name + role only.
+    assert_eq!(world.env.board_get("item:watch").await, None);
     let rules = world.env.rules_for("nobody").await;
     assert_eq!(rules.len(), 2);
     for id in &world.agents {
-        assert_eq!(s.list_tasks(id, None).await.unwrap().len(), 1);
+        assert_eq!(s.list_tasks(id, None).await.unwrap().len(), 0);
     }
+    let roster: Vec<(String, String)> = s
+        .list_agents()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|a| (a.name, a.role))
+        .collect();
+    assert!(roster.contains(&("buyer".into(), "buyer".into())));
+    assert!(roster.contains(&("seller".into(), "seller".into())));
 }
 
 /// Live multi-agent negotiation: buyer (budget $100) vs seller (floor $70).

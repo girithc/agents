@@ -21,28 +21,52 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use tracing::Event;
 
-/// Simple mode: `LEVEL message field=value ...` — no span chains, no
-/// targets, no UUID noise. The full detail still goes to SQLite.
+/// Governance mode: `HH:MM:SS agent[model] did-what[why]` — no INFO/DEBUG
+/// noise, no field dumps. WARN/ERROR keep a level tag. Everything dropped
+/// here (kind, full fields) still goes to SQLite verbatim.
 struct SimpleFormat;
 
-struct FieldString(String, bool);
+const THOUGHT_MAX: usize = 160;
 
-impl tracing::field::Visit for FieldString {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.0.push_str(&format!("{value:?}"));
-            self.1 = true;
-        } else {
-            self.0.push_str(&format!("  {}={value:?}", field.name()));
+/// Collected event fields for one console line. `message`, `agent`, `model`
+/// and `thought` shape the line; `kind` is structural (SQLite only); the
+/// rest prints only on fallback lines and warnings.
+#[derive(Default)]
+struct LineParts {
+    message: Option<String>,
+    agent: Option<String>,
+    model: Option<String>,
+    thought: Option<String>,
+    rest: Vec<(String, String)>,
+}
+
+impl LineParts {
+    fn put(&mut self, name: &str, value: String) {
+        match name {
+            "message" => self.message = Some(value),
+            "agent" => self.agent = Some(value),
+            "model" => self.model = Some(value),
+            "thought" => self.thought = Some(value),
+            "kind" => {}
+            other => self.rest.push((other.to_string(), value)),
         }
     }
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" {
-            self.0.push_str(value);
-            self.1 = true;
+
+    fn excerpt(s: &str) -> String {
+        if s.chars().count() > THOUGHT_MAX {
+            format!("{}…", s.chars().take(THOUGHT_MAX).collect::<String>())
         } else {
-            self.0.push_str(&format!("  {}={value}", field.name()));
+            s.to_string()
         }
+    }
+}
+
+impl tracing::field::Visit for LineParts {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.put(field.name(), format!("{value:?}"));
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.put(field.name(), value.to_string());
     }
 }
 
@@ -70,11 +94,39 @@ where
             (tod % 3600) / 60,
             tod % 60
         )?;
-        let level = event.metadata().level().to_string();
-        write!(writer, " {level:<5} ")?;
-        let mut v = FieldString(String::new(), false);
-        event.record(&mut v);
-        writeln!(writer, "{}", v.0)
+
+        let level = event.metadata().level();
+        let severe = matches!(*level, tracing::Level::ERROR | tracing::Level::WARN);
+        let mut p = LineParts::default();
+        event.record(&mut p);
+
+        match (&p.agent, &p.model) {
+            (Some(agent), Some(model)) => {
+                write!(writer, " {agent}[{model}]")?;
+                if let Some(m) = &p.message {
+                    write!(writer, " {}", LineParts::excerpt(m))?;
+                }
+                if let Some(t) = p.thought.as_deref().filter(|t| !t.is_empty()) {
+                    write!(writer, "[{}]", LineParts::excerpt(t))?;
+                }
+                if severe {
+                    write!(writer, " [{level}]")?;
+                }
+            }
+            _ => {
+                // Non-agent events: keep the old shape, minus INFO/DEBUG.
+                if severe {
+                    write!(writer, " {level}")?;
+                }
+                if let Some(m) = &p.message {
+                    write!(writer, " {m}")?;
+                }
+                for (k, v) in &p.rest {
+                    write!(writer, "  {k}={v}")?;
+                }
+            }
+        }
+        writeln!(writer)
     }
 }
 

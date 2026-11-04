@@ -10,6 +10,7 @@ fn row_to_agent(row: &Row<'_>) -> rusqlite::Result<Agent> {
     Ok(Agent {
         id: row.get("id")?,
         name: row.get("name")?,
+        role: row.get("role")?,
         system_prompt: row.get("system_prompt")?,
         provider: row.get("provider")?,
         model: row.get("model")?,
@@ -23,7 +24,7 @@ fn row_to_agent(row: &Row<'_>) -> rusqlite::Result<Agent> {
     })
 }
 
-const AGENT_COLS: &str = "id, name, system_prompt, provider, model, temperature, \
+const AGENT_COLS: &str = "id, name, role, system_prompt, provider, model, temperature, \
      max_output_tokens, max_iterations, reasoning_effort, version, created_at, updated_at";
 
 impl Store {
@@ -34,12 +35,13 @@ impl Store {
         self.db
             .exec(move |c| {
                 c.execute(
-                    "INSERT INTO agents (id, name, system_prompt, provider, model, temperature, \
+                    "INSERT INTO agents (id, name, role, system_prompt, provider, model, temperature, \
                      max_output_tokens, max_iterations, reasoning_effort, version, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?11)",
                     params![
                         id,
                         new.name,
+                        new.role,
                         new.system_prompt,
                         new.provider,
                         new.model,
@@ -106,6 +108,7 @@ impl Store {
         };
         let a = Agent {
             name: upd.name.unwrap_or(existing.name),
+            role: upd.role.unwrap_or(existing.role),
             system_prompt: upd.system_prompt.unwrap_or(existing.system_prompt),
             provider: upd.provider.unwrap_or(existing.provider),
             model: upd.model.unwrap_or(existing.model),
@@ -122,11 +125,12 @@ impl Store {
         self.db
             .exec(move |c| {
                 c.execute(
-                    "UPDATE agents SET name=?1, system_prompt=?2, provider=?3, model=?4, \
-                     temperature=?5, max_output_tokens=?6, max_iterations=?7, reasoning_effort=?8, \
-                     updated_at=?9 WHERE id=?10",
+                    "UPDATE agents SET name=?1, role=?2, system_prompt=?3, provider=?4, model=?5, \
+                     temperature=?6, max_output_tokens=?7, max_iterations=?8, reasoning_effort=?9, \
+                     updated_at=?10 WHERE id=?11",
                     params![
                         a.name,
+                        a.role,
                         a.system_prompt,
                         a.provider,
                         a.model,

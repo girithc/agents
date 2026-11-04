@@ -77,7 +77,9 @@ creates — so a run, its trace tree, and the originating HTTP request are
 correlatable end to end.
 
 Console output honors `RUST_LOG` (default `info`); set `AGENTHUB_LOG_JSON=1`
-for JSON logs.
+for JSON logs. Agent-activity lines use the governance format
+`HH:MM:SS agent[model] action[reasoning]` — no level noise (WARN/ERROR keep
+a level tag); the full structured fields are always persisted to SQLite.
 
 ## Quickstart
 
