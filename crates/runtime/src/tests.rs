@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use agenthub_providers::meta::MetaProvider;
 use agenthub_providers::registry::Registry;
+use agenthub_providers::{CompletionRequest, CompletionResponse, Provider, ProviderError};
 use agenthub_storage::store::agent::AgentTaskStatus;
 use agenthub_storage::{NewAgent, Store, Vault};
 
@@ -19,6 +20,48 @@ use crate::process::{spawn_agent_loop, AgentDeps};
 use crate::supervisor::Supervisor;
 
 // ------------------------------------------------------------ helpers
+
+/// Deterministic offline provider for loop-mechanics tests: replies with
+/// plain text, no tool calls — an idle think costs nothing.
+struct MockProvider;
+
+#[async_trait::async_trait]
+impl Provider for MockProvider {
+    fn id(&self) -> &'static str {
+        "mock"
+    }
+
+    async fn complete(
+        &self,
+        _req: CompletionRequest,
+    ) -> agenthub_providers::Result<CompletionResponse> {
+        Ok(CompletionResponse {
+            text: "nothing to do right now".into(),
+            reasoning: None,
+            tool_calls: vec![],
+            usage: None,
+            raw: serde_json::json!({ "mock": true }),
+        })
+    }
+
+    async fn complete_stream(
+        &self,
+        _req: CompletionRequest,
+    ) -> agenthub_providers::Result<
+        futures::stream::BoxStream<
+            'static,
+            agenthub_providers::Result<agenthub_providers::StreamEvent>,
+        >,
+    > {
+        Err(ProviderError::Stream("mock", "does not stream".into()))
+    }
+}
+
+fn mock_brain(s: Arc<Store>) -> Arc<LlmBrain> {
+    let registry = Registry::new();
+    registry.register(Arc::new(MockProvider));
+    Arc::new(LlmBrain::new(s, Arc::new(registry)))
+}
 
 fn register_key(s: &Store) -> bool {
     match crate::model_api_key() {
@@ -83,22 +126,36 @@ async fn wait_task_status(
 // (no model calls: the queue stays empty or the brain errors offline)
 
 #[tokio::test]
-async fn empty_queue_never_calls_brain() {
+async fn empty_queue_triggers_idle_think() {
     let s = store().await;
     let env_row = s.create_environment("t", 20).await.unwrap();
     let env = EnvHandle::new(s.clone(), &env_row.id);
-    let agent_id = agent_row(&s, "idle", "meta").await;
-    let brain = meta_brain(s.clone());
+    let agent_id = agent_row(&s, "idle", "mock").await;
+    let brain = mock_brain(s.clone());
 
     let handle = spawn_agent_loop(
         AgentDeps { store: s.clone(), env, agent_id: agent_id.clone() },
         brain,
     );
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    let st = s.get_state(&agent_id).await.unwrap().unwrap();
-    assert_ne!(st.status, agenthub_storage::store::agent::AgentStatus::Thinking);
-    assert_ne!(st.status, agenthub_storage::store::agent::AgentStatus::Stopped);
+    // The queue is empty, so the loop hands the microphone to the soul:
+    // one idle think (mock provider), and because it neither acted nor
+    // requested sleep, the loop settles into the 30s backoff nap — not
+    // the environment's 20ms tick.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut backed_off = false;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(st) = s.get_state(&agent_id).await.unwrap() {
+            if let Some(wake_at) = st.next_wake_at {
+                if wake_at >= agenthub_storage::now_ms() + 25_000 {
+                    backed_off = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(backed_off, "empty queue should end in an idle think + 30s backoff nap");
 
     handle.stop();
     handle.finished().await;

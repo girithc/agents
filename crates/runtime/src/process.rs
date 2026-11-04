@@ -1,9 +1,11 @@
 //! The loop: one tokio task per agent.
 //!
-//! Simple contract: wake → look for work → think → sleep → repeat. The
-//! agent is always either thinking or sleeping; sleep length is pulled
-//! from the environment (or requested by the brain). Mail — a task hint,
-//! a direct message, or stop — interrupts any sleep. All state transitions
+//! Simple contract: wake → look for work → think → sleep → repeat. An
+//! empty queue is not rest: the agent gets one think on its own
+//! initiative — the soul decides whether to act or sleep. The agent is
+//! always either thinking or sleeping; sleep length is pulled from the
+//! environment (or requested by the brain). Mail — a task hint, a direct
+//! message, or stop — interrupts any sleep. All state transitions
 //! land in `agent_state`; notes land in `agent_memory`.
 
 use std::sync::Arc;
@@ -17,6 +19,10 @@ use tracing::Instrument;
 
 use crate::brain::{AgentTools, Brain, ThinkCtx};
 use crate::env::EnvHandle;
+
+/// Naps this long after an idle think that neither acted nor requested a
+/// sleep — an eager world stays responsive, a resting one idles cheaply.
+const IDLE_BACKOFF_MS: u64 = 30_000;
 
 /// Anything that can wake an agent mid-wait.
 pub enum Mail {
@@ -124,6 +130,7 @@ async fn run(
         };
         // Brain may override the next sleep length (None = use env cadence).
         let mut requested_sleep: Option<u64> = None;
+        let mut idle_backoff = false;
 
         tokio::select! {
             mail = rx.recv() => {
@@ -153,7 +160,7 @@ async fn run(
                             task_title = "message",
                         );
                         let ctx = think_ctx(&store, &env, &agent_id, &think_id, "message", &body).await;
-                        let outcome = run_think(&store, brain.as_ref(), &tools, &ctx, None)
+                        let outcome = run_think(&store, brain.as_ref(), &tools, &ctx, None, true)
                             .instrument(span)
                             .await;
                         // The mail path uses the outcome's sleep request below.
@@ -168,20 +175,37 @@ async fn run(
                 }
                 first_pass = false;
                 let _ = store.set_state(&agent_id, AgentStatus::Idle, None, None).await;
-                if let Some(task) = pop(&store, &agent_id).await {
-                    let out = run_task(&store, brain.as_ref(), &tools, &env, &task).await;
-                    requested_sleep = out.and_then(|o| o.sleep_ms);
+                match pop(&store, &agent_id).await {
+                    Some(task) => {
+                        let out = run_task(&store, brain.as_ref(), &tools, &env, &task).await;
+                        requested_sleep = out.and_then(|o| o.sleep_ms);
+                    }
+                    None => {
+                        // No queued work is not "no self": hand the
+                        // microphone to the soul. This is how first
+                        // contact happens without seeds or broadcasts.
+                        let out = run_idle_think(&store, brain.as_ref(), &tools, &env).await;
+                        requested_sleep = out.as_ref().and_then(|o| o.sleep_ms);
+                        // An idle think that neither acted nor requested a
+                        // sleep earns the long nap, not the tick.
+                        idle_backoff = requested_sleep.is_none();
+                    }
                 }
             }
         }
 
-        // Sleep again: brain's request wins, otherwise pull the environment's
-        // cadence ourselves right before sleeping.
+        // Sleep again: brain's request wins, otherwise the idle guard's
+        // long nap, otherwise the environment's cadence.
         let ms = match requested_sleep {
             Some(ms) => ms,
             None => {
                 tracing::debug!(agent = %who, "no work left, napping");
-                env.tick_interval().await.as_millis() as u64
+                if idle_backoff {
+                    tracing::debug!(agent = %who, "idle think had no action, longer nap");
+                    IDLE_BACKOFF_MS
+                } else {
+                    env.tick_interval().await.as_millis() as u64
+                }
             }
         };
         sleep_until = apply_sleep(&store, &who, &agent_id, ms).await;
@@ -229,7 +253,7 @@ async fn run_task(
             .set_state(tools.agent_id(), AgentStatus::Thinking, Some(&task.id), None)
             .await;
         let ctx = think_ctx(store, env, tools.agent_id(), &run_id, &task.title, &task.body).await;
-        let out = run_think(store, brain, tools, &ctx, Some(&task.id)).await;
+        let out = run_think(store, brain, tools, &ctx, Some(&task.id), true).await;
         let note = out.as_ref().map(|o| o.note.clone()).unwrap_or_default();
         let note = if note.chars().count() > 100 {
             format!("{}...", note.chars().take(100).collect::<String>())
@@ -255,6 +279,7 @@ async fn run_think(
     tools: &AgentTools,
     ctx: &ThinkCtx,
     task_id: Option<&str>,
+    remember_note: bool,
 ) -> Option<crate::brain::ThinkOutcome> {
     let outcome = match brain.think(ctx, tools).await {
         Ok(o) => o,
@@ -271,13 +296,67 @@ async fn run_think(
             return None;
         }
     };
-    let _ = store
-        .remember(tools.agent_id(), MemoryKind::Reflection, &outcome.note)
-        .await;
+    if remember_note {
+        let _ = store
+            .remember(tools.agent_id(), MemoryKind::Reflection, &outcome.note)
+            .await;
+    }
     if let Some(id) = task_id {
         let _ = store.finish_task(id, outcome.ok).await;
     }
     Some(outcome)
+}
+
+/// One think on the agent's own initiative: the queue was empty, so the
+/// loop hands the microphone to the soul. Nothing is finished (no task)
+/// and nothing is remembered (a resting agent must not spam its own
+/// notebook) — the trace keeps the governance record either way.
+async fn run_idle_think(
+    store: &Arc<Store>,
+    brain: &dyn Brain,
+    tools: &AgentTools,
+    env: &EnvHandle,
+) -> Option<crate::brain::ThinkOutcome> {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let span = tracing::info_span!(
+        "agent.think",
+        run_id = %run_id,
+        agent = %tools.agent_id(),
+        task_id = tracing::field::Empty,
+        task_title = "own initiative",
+    );
+    async move {
+        let ctx = think_ctx(
+            store,
+            env,
+            tools.agent_id(),
+            &run_id,
+            "own initiative",
+            "Nothing is queued for you right now. Consult your soul and goal: \
+             if there is anything you should be doing — start work, approach \
+             someone, follow up — act now with your tools. If there is truly \
+             nothing to do, call sleep.",
+        )
+        .await;
+        match brain.think(&ctx, tools).await {
+            Err(e) => {
+                tracing::warn!(agent = %tools.agent_name(), model = %tools.agent_model(), error = %e, "idle think failed");
+                None
+            }
+            Ok(out) => {
+                tracing::info!(
+                    agent = %tools.agent_name(),
+                    model = %tools.agent_model(),
+                    kind = "idle",
+                    thought = %out.note,
+                    "own initiative"
+                );
+                Some(out)
+            }
+        }
+    }
+    .instrument(span)
+    .await
 }
 
 async fn think_ctx(
