@@ -35,6 +35,12 @@ pub struct MemoryRow {
 }
 
 impl Store {
+    /// Write a memory — with an echo filter. The LLM loves to restate
+    /// itself ("Offered $70 for the watch…", then "Offered $70 to seller,
+    /// meeting their minimum…"): a note that reads like one we just wrote
+    /// collapses into the existing row instead of piling up. Distinct
+    /// facts survive: a different first word (offered vs accepted) or a
+    /// different number ($70 vs $75) is news, never an echo.
     pub async fn remember(&self, agent_id: &str, kind: MemoryKind, content: &str) -> Result<i64> {
         let (aid, kind, content) = (
             agent_id.to_string(),
@@ -43,6 +49,21 @@ impl Store {
         );
         self.db
             .exec(move |c| {
+                // The recent window this note could be an echo of.
+                let recent: Vec<(i64, String)> = {
+                    let mut stmt = c.prepare(
+                        "SELECT id, content FROM agent_memory \
+                         WHERE agent_id = ?1 ORDER BY id DESC LIMIT 8",
+                    )?;
+                    let rows = stmt.query_map(params![aid], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                let want = EchoFingerprint::of(&content);
+                for (id, seen) in &recent {
+                    if want.is_echo_of(&EchoFingerprint::of(seen)) {
+                        return Ok(*id);
+                    }
+                }
                 c.execute(
                     "INSERT INTO agent_memory (agent_id, kind, content, created_at) \
                      VALUES (?1, ?2, ?3, ?4)",
@@ -131,6 +152,42 @@ fn row_to_memory(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRow> {
     })
 }
 
+// ---------------------------------------------------------------- echo filter
+
+/// What makes a note itself: its first word, its numbers, its words.
+/// Echoes match all three; news differs in at least one.
+struct EchoFingerprint {
+    first: String,
+    numbers: Vec<String>,
+    tokens: std::collections::HashSet<String>,
+}
+
+impl EchoFingerprint {
+    fn of(content: &str) -> Self {
+        let tokens: Vec<String> = content
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .collect();
+        EchoFingerprint {
+            first: tokens.first().cloned().unwrap_or_default(),
+            numbers: tokens.iter().filter(|t| t.chars().all(|c| c.is_ascii_digit())).cloned().collect(),
+            tokens: tokens.into_iter().collect(),
+        }
+    }
+
+    /// Same first word + same numbers + word-overlap ≥ 0.5 → echo.
+    fn is_echo_of(&self, seen: &EchoFingerprint) -> bool {
+        if self.first != seen.first || self.numbers != seen.numbers {
+            return false;
+        }
+        let inter = self.tokens.intersection(&seen.tokens).count();
+        let union = self.tokens.union(&seen.tokens).count();
+        union > 0 && (inter as f64) / (union as f64) >= 0.5
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +216,32 @@ mod tests {
         let recent = s.recent_memory("a1", 10).await.unwrap();
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].content, "Sent follow-up email to Bob.");
+    }
+
+    #[tokio::test]
+    async fn echo_of_a_recent_note_collapses() {
+        let s = store().await;
+        let first = s
+            .remember("a1", MemoryKind::Reflection, "Offered $70 for the watch to seller, waiting for their response.")
+            .await
+            .unwrap();
+        // Rewording of the same fact: collapses into the first row.
+        let again = s
+            .remember("a1", MemoryKind::Reflection, "Offered $70 to seller, meeting their minimum, waiting for reply.")
+            .await
+            .unwrap();
+        assert_eq!(first, again);
+        assert_eq!(s.recent_memory("a1", 10).await.unwrap().len(), 1);
+
+        // A different price is news: stored.
+        s.remember("a1", MemoryKind::Reflection, "Offered $75 to the seller, waiting.")
+            .await
+            .unwrap();
+        // A different verb is news: stored.
+        s.remember("a1", MemoryKind::Reflection, "Accepted $70 from the seller, closing now.")
+            .await
+            .unwrap();
+        let recent = s.recent_memory("a1", 10).await.unwrap();
+        assert_eq!(recent.len(), 3);
     }
 }

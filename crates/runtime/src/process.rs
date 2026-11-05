@@ -515,7 +515,7 @@ async fn think_ctx(
         soul,
         goal,
         rules: env.rules_for(agent_id).await,
-        todo: store.list_tasks(agent_id, None).await.unwrap_or_default(),
+        todo: store.open_tasks(agent_id).await.unwrap_or_default(),
         board: env.board_snapshot().await,
     }
 }

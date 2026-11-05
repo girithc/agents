@@ -185,6 +185,41 @@ impl Store {
             .await
     }
 
+    /// The agent's OPEN work — queued + doing. This is the to-do the model
+    /// should see in its prompts: settled history stays in the DB (audit
+    /// via `list_tasks`) without crowding the present.
+    pub async fn open_tasks(&self, agent_id: &str) -> Result<Vec<AgentTask>> {
+        let aid = agent_id.to_string();
+        self.db
+            .exec(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT id, agent_id, title, body, status, thread_id, created_at, done_at \
+                     FROM agent_tasks WHERE agent_id = ?1 AND status IN ('queued','doing') \
+                     ORDER BY created_at",
+                )?;
+                let rows = stmt.query_map(params![aid], |r| {
+                    let status: String = r.get(4)?;
+                    Ok(AgentTask {
+                        id: r.get(0)?,
+                        agent_id: r.get(1)?,
+                        title: r.get(2)?,
+                        body: r.get(3)?,
+                        status: match status.as_str() {
+                            "doing" => AgentTaskStatus::Doing,
+                            "done" => AgentTaskStatus::Done,
+                            "failed" => AgentTaskStatus::Failed,
+                            _ => AgentTaskStatus::Queued,
+                        },
+                        thread_id: r.get(5)?,
+                        created_at: r.get(6)?,
+                        done_at: r.get(7)?,
+                    })
+                })?;
+                rows.collect()
+            })
+            .await
+    }
+
     /// The agent's to-do list: queued + doing by default, or any status filter.
     pub async fn list_tasks(
         &self,

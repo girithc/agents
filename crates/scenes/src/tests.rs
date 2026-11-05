@@ -42,8 +42,10 @@ async fn scene_setup_is_complete() {
     // it privately), no seeded tasks (the roster + souls drive first
     // contact), and the roster carries name + role only.
     assert_eq!(world.env.board_get("item:watch").await, None);
+    // The handshake law must be on the books (rules evolve; the count
+    // itself isn't the contract).
     let rules = world.env.rules_for("nobody").await;
-    assert_eq!(rules.len(), 3);
+    assert!(rules.iter().any(|r| r.contains("accept_deal")));
     for id in &world.agents {
         assert_eq!(s.list_tasks(id, None).await.unwrap().len(), 0);
     }

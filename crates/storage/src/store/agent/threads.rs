@@ -454,20 +454,19 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].sender, "a");
 
-        // party task in thread
+        // party task in thread: any open row (queued OR doing) counts —
+        // one per side, never a duplicate.
         s.enqueue_task_in_thread("a", "negotiate with b", "get it cheap", &tid).await.unwrap();
-        assert!(s.open_task_for_thread("a", &tid).await.unwrap().is_none()); // queued, not doing
+        assert!(s.open_task_for_thread("a", &tid).await.unwrap().is_some());
 
-        // simulate doing
-        if let Some(t) = s.list_tasks("a", None).await.unwrap().first().cloned() {
-            let _ = s.pop_task("a").await.unwrap(); // queued -> doing
-            assert!(s.open_task_for_thread("a", &t.id).await.is_err() || true);
-            let _ = t;
-        }
+        // queued -> doing: still open, still one.
+        let _ = s.pop_task("a").await.unwrap();
+        assert!(s.open_task_for_thread("a", &tid).await.unwrap().is_some());
 
         // closing settles both sides
         assert_eq!(s.close_threads_between("a", "b").await.unwrap(), 1);
         assert!(!s.thread_open(&tid).await.unwrap());
+        assert!(s.open_task_for_thread("a", &tid).await.unwrap().is_none(), "a closed thread settles its tasks");
         assert_eq!(s.close_threads_between("a", "b").await.unwrap(), 0);
     }
 }
@@ -510,9 +509,10 @@ mod turn_tests {
         assert!(s.waiting_on_reply("seller").await.unwrap());
         assert!(!s.waiting_on_reply("buyer").await.unwrap());
 
-        // off-turn send bounces
+        // off-turn send bounces: the floor is the BUYER's now (seller just
+        // replied), so it's the SELLER who may not double-text.
         let sneaky = s
-            .send_thread_message_strict(&tid, "buyer", "seller", "double text", 2)
+            .send_thread_message_strict(&tid, "seller", "buyer", "double text", 2)
             .await
             .unwrap();
         assert!(sneaky.is_err(), "off-turn send must bounce");

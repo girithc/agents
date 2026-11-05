@@ -256,16 +256,29 @@ impl_tool!(TalkTo, "talk_to",
         "what": { "type": "string", "description": "what you say" }
     }), &["who", "what"]),
     describe(v) {
-        format!(
-            "spoke with {}{}",
-            v.get("to").and_then(Value::as_str).unwrap_or("someone"),
-            err_suffix(v)
-        )
+        if v.get("deferred").and_then(Value::as_bool) == Some(true) {
+            format!(
+                "held the floor for {} (their words arrived mid-think — revise when they return)",
+                v.get("to").and_then(Value::as_str).unwrap_or("someone")
+            )
+        } else {
+            format!(
+                "spoke with {}{}",
+                v.get("to").and_then(Value::as_str).unwrap_or("someone"),
+                err_suffix(v)
+            )
+        }
     },
     call(args, tools) {
         match (arg_str(args, "who"), arg_str(args, "what")) {
             (Some(who), Some(what)) => match tools.talk_to(&who, &what).await {
-                Ok(()) => Ok(json!({ "ok": true, "to": who })),
+                Ok(true) => Ok(json!({ "ok": true, "to": who })),
+                Ok(false) => Ok(json!({
+                    "ok": false, "deferred": true, "to": who,
+                    "note": "their words arrived while you were thinking — your words \
+                             were NOT sent. The floor returns to you: their fresh words \
+                             are in your inbox — revise your reply and send then."
+                })),
                 Err(e) => Err(e),
             },
             (None, _) => Err("missing 'who'".into()),

@@ -196,7 +196,12 @@ impl AgentTools {
     /// you two (or open one), land in their durable inbox, and a knock
     /// wakes them now if they're live. Both parties keep their own task
     /// row for the thread — words are shared, perspectives are not.
-    pub async fn talk_to(&self, who: &str, what: &str) -> Result<(), String> {
+    ///
+    /// Returns `Ok(false)` when the channel moved mid-think: nothing was
+    /// sent, the floor comes back to you with their fresh words queued in
+    /// your own inbox (the base knocks you awake for it) — revise and send
+    /// then. Not an error: a busy world does this all the time.
+    pub async fn talk_to(&self, who: &str, what: &str) -> Result<bool, String> {
         let other = self
             .store
             .get_agent(who)
@@ -254,31 +259,34 @@ impl AgentTools {
             .send_thread_message_strict(&thread_id, &self.agent_id, &other.id, what, known_count)
             .await
             .map_err(|e| e.to_string())?;
-        if let Err((fresh_count, fresh)) = sent {
-            // The sender has now SEEN the fresh words (they're in this
-            // error) — advance their pin, so a revised resend goes through
-            // unless yet another message lands mid-revision.
+        if let Err((fresh_count, _fresh)) = sent {
+            // The channel moved mid-think: our draft is stale. Advance the
+            // pin so the next send goes through, make sure our thread task
+            // is open, and knock OURSELVES awake — the next think re-enters
+            // the thread with their fresh words in context. A deferral, not
+            // a failure: busy worlds collide constantly, and the revise is
+            // the model's job with proper context, not a cramped error.
             self.set_current_thread(Some(&thread_id), fresh_count);
-            let mut lines = Vec::new();
-            for (sender_id, said) in fresh.iter().rev() {
-                let who = if *sender_id == other.id {
-                    other.name.clone()
-                } else {
-                    self.store
-                        .get_agent(sender_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|a| a.name)
-                        .unwrap_or_else(|| sender_id.clone())
-                };
-                lines.push(format!("{who} said: \"{said}\""));
-            }
-            return Err(format!(
-                "channel moved while you were thinking — {}. \
-                 Revise your reply with their words and try talk_to again.",
-                lines.join(" | ")
-            ));
+            let own = match self
+                .store
+                .open_task_for_thread(&self.agent_id, &thread_id)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                Some(t) => t,
+                None => self
+                    .store
+                    .enqueue_task_in_thread(
+                        &self.agent_id,
+                        &format!("talking with {}", other.name),
+                        what,
+                        &thread_id,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?,
+            };
+            self.env.phonebook().knock(&self.agent_id, Mail::Task(own.id));
+            return Ok(false);
         }
         self.set_current_thread(Some(&thread_id), known_count + 1);
 
@@ -322,7 +330,7 @@ impl AgentTools {
         };
 
         self.env.phonebook().knock(&other.id, Mail::Task(task.id));
-        Ok(())
+        Ok(true)
     }
 
     /// Leave the thread you're in: your task closes, the counterpart is
