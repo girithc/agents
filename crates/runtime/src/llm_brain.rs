@@ -186,13 +186,6 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             ),
         },
         ToolSpec {
-            name: "who_is_here".into(),
-            description: "The roster of this world: every agent's name and role. \
-                          Names and roles only — never anyone's inventory or prices."
-                .into(),
-            parameters: obj(json!({}), &[]),
-        },
-        ToolSpec {
             name: "subscribe".into(),
             description: "Follow a board key: every future change to it is delivered \
                           to your inbox and wakes you (including changes you cause \
@@ -212,6 +205,22 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 json!({ "key": { "type": "string" } }),
                 &["key"],
             ),
+        },
+        ToolSpec {
+            name: "leave_thread".into(),
+            description: "Leave the negotiation you're in: your task closes and \
+                          the other side is notified in the thread. Use it when \
+                          the deal is off for you (price out of reach, time up)."
+                .into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "close_thread".into(),
+            description: "End the conversation you're in — 'we're done here'. \
+                          Settles the task for both sides and tells them. Use it \
+                          when the matter is truly finished (deal closed, chat over)."
+                .into(),
+            parameters: json!({ "type": "object", "properties": {} }),
         },
         ToolSpec {
             name: "sleep".into(),
@@ -294,32 +303,16 @@ pub async fn dispatch_tool(
             (None, _) => Err("missing 'who'".into()),
             (_, None) => Err("missing 'what'".into()),
         },
-        "who_is_here" => {
-            let roster = tools
-                .directory()
-                .await
-                .into_iter()
-                .map(|(name, role)| json!({ "name": name, "role": role }))
-                .collect::<Vec<_>>();
-            Ok(json!(roster))
-        }
-        "subscribe" => match arg_str(&args, "key") {
-            Some(key) => {
-                tools.subscribe(&key).await;
-                // The result carries the key's current state so the agent
-                // starts its follow-up from the present, not from a stale
-                // prompt picture.
-                let current = tools.board_get(&key).await;
-                Ok(json!({ "ok": true, "following": key, "current": current }))
-            }
-            None => Err("missing 'key'".into()),
-        },
         "unsubscribe" => match arg_str(&args, "key") {
             Some(key) => {
                 tools.unsubscribe(&key).await;
                 Ok(json!({ "ok": true, "following": null }))
             }
             None => Err("missing 'key'".into()),
+        },
+        "leave_thread" => match tools.leave_thread().await {
+            Ok(()) => Ok(json!({ "ok": true })),
+            Err(e) => Err(e),
         },
         "sleep" => {
             let secs = args.get("seconds").and_then(Value::as_f64).unwrap_or(0.0);
@@ -358,13 +351,14 @@ fn friendly_line(call: &ToolCall, out: &str) -> String {
             "spoke with {}{err}",
             v.get("to").and_then(Value::as_str).unwrap_or("someone")
         ),
-        "who_is_here" => format!("looked at the roster{err}"),
         "subscribe" => format!(
             "started following {}{err}",
             v.get("following").and_then(Value::as_str).unwrap_or("a key")
         ),
         "unsubscribe" => format!("stopped following {}{err}",
             v.get("following").and_then(Value::as_str).unwrap_or("a key")),
+        "leave_thread" => format!("left the negotiation{err}"),
+        "close_thread" => format!("closed the conversation{err}"),
         "sleep" => format!("went to sleep{err}"),
         other => format!("used {other}{err}"),
     }
@@ -407,7 +401,9 @@ impl Brain for LlmBrain {
              arguments. NEVER call `sleep` while your current task still needs an \
              action — finish the task first. `sleep` immediately ends your turn and \
              is only for when the task is done (or impossible) and nothing else is \
-             queued.",
+             queued. The people (roster) and the conversation so far are ALREADY in \
+             your context — never re-check them. If you are mid-negotiation, CONTINUE \
+             it: reply with your next counter or close; do not start over.",
         );
 
         // User: the task + my to-do + the board.
@@ -418,11 +414,35 @@ impl Brain for LlmBrain {
             .collect();
         let board: std::collections::BTreeMap<String, &Value> =
             ctx.board.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let roster_lines: Vec<String> = ctx
+            .roster
+            .iter()
+            .map(|(n, r, talking)| {
+                if *talking {
+                    format!("- {n} (role: {r}) — you ALREADY have an open conversation with them; never re-approach, wait for their reply")
+                } else {
+                    format!("- {n} (role: {r})")
+                }
+            })
+            .collect();
+        let thread_lines: Vec<String> = ctx
+            .thread
+            .as_ref()
+            .map(|t| t.messages.iter().map(|(who, said)| format!("{who} said: {said}")).collect())
+            .unwrap_or_default();
+        let asset_lines: Vec<String> = ctx
+            .assets
+            .iter()
+            .map(|a| format!("- {} {}: {}", a.kind, a.name, a.qty))
+            .collect();
         let user = format!(
-            "TASK: {title}\n{body}\n\nYOUR TO-DO:\n{todo}\n\nENVIRONMENT BOARD:\n{board}",
+            "TASK: {title}\n{body}\n\nWHAT YOU OWN:\n{assets}\n\nCONVERSATION SO FAR:\n{thread}\n\nYOUR TO-DO:\n{todo}\n\nPEOPLE IN THIS WORLD (name — role, already known; do NOT re-check):\n{roster}\n\nENVIRONMENT BOARD:\n{board}",
             title = ctx.task_title,
             body = ctx.task_body,
+            assets = if asset_lines.is_empty() { "(nothing)".into() } else { asset_lines.join("\n") },
+            thread = if thread_lines.is_empty() { "(nothing yet — you start)".into() } else { thread_lines.join("\n") },
             todo = if todo_lines.is_empty() { "(empty)".into() } else { todo_lines.join("\n") },
+            roster = roster_lines.join("\n"),
             board = serde_json::to_string_pretty(&board).unwrap_or_default(),
         );
 

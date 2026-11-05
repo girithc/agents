@@ -100,14 +100,17 @@ where
         let mut p = LineParts::default();
         event.record(&mut p);
 
+        // Correlation id: binds every line from one think.
+        let tag = p.rest.get("t").cloned().unwrap_or_default();
         match (&p.agent, &p.model) {
-            (Some(agent), Some(model)) => {
-                write!(writer, " {agent}[{model}]")?;
+            (Some(agent), _) => {
+                if tag.is_empty() {
+                    write!(writer, " {agent}")?;
+                } else {
+                    write!(writer, " {agent}[{tag}]")?;
+                }
                 if let Some(m) = &p.message {
                     write!(writer, " {}", LineParts::excerpt(m))?;
-                }
-                if let Some(t) = p.thought.as_deref().filter(|t| !t.is_empty()) {
-                    write!(writer, "[{}]", LineParts::excerpt(t))?;
                 }
                 if severe {
                     write!(writer, " [{level}]")?;

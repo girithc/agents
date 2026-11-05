@@ -14,6 +14,9 @@ pub enum StorageError {
     #[error("secret not found: {0}")]
     SecretNotFound(String),
 
+    #[error("insufficient assets: {0}")]
+    Insufficient(String),
+
     #[error("not found: {0}")]
     NotFound(String),
 }

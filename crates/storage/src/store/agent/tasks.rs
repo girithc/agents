@@ -34,6 +34,9 @@ pub struct AgentTask {
     pub title: String,
     pub body: String,
     pub status: AgentTaskStatus,
+    /// Some tasks belong to a negotiation thread (both parties have their
+    /// own task row; the words live in agent_messages).
+    pub thread_id: Option<String>,
     pub created_at: i64,
     pub done_at: Option<i64>,
 }
@@ -51,8 +54,8 @@ impl Store {
         self.db
             .exec(move |c| {
                 c.execute(
-                    "INSERT INTO agent_tasks (id, agent_id, title, body, status, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, 'queued', ?5)",
+                    "INSERT INTO agent_tasks (id, agent_id, title, body, status, thread_id, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, 'queued', NULL, ?5)",
                     params![task_id, aid, title_txt, body_txt, now],
                 )
             })
@@ -63,6 +66,7 @@ impl Store {
             title: title.to_string(),
             body: body.to_string(),
             status: AgentTaskStatus::Queued,
+            thread_id: None,
             created_at: now,
             done_at: None,
         })
@@ -126,7 +130,7 @@ impl Store {
         self.db
             .exec(move |c| {
                 c.query_row(
-                    "SELECT id, agent_id, title, body, status, created_at, done_at \
+                    "SELECT id, agent_id, title, body, status, thread_id, created_at, done_at \
                      FROM agent_tasks WHERE id = ?1",
                     params![id],
                     |r| {
@@ -142,8 +146,9 @@ impl Store {
                                 "failed" => AgentTaskStatus::Failed,
                                 _ => AgentTaskStatus::Queued,
                             },
-                            created_at: r.get(5)?,
-                            done_at: r.get(6)?,
+                            thread_id: r.get(5)?,
+                            created_at: r.get(6)?,
+                            done_at: r.get(7)?,
                         })
                     },
                 )
@@ -166,7 +171,7 @@ impl Store {
         self.db
             .exec(move |c| {
                 let mut stmt = c.prepare(
-                    "SELECT id, agent_id, title, body, status, created_at, done_at \
+                    "SELECT id, agent_id, title, body, status, thread_id, created_at, done_at \
                      FROM agent_tasks WHERE agent_id = ?1 \
                      AND (?2 IS NULL OR status = ?2) \
                      ORDER BY created_at",
@@ -184,8 +189,9 @@ impl Store {
                             "failed" => AgentTaskStatus::Failed,
                             _ => AgentTaskStatus::Queued,
                         },
-                        created_at: r.get(5)?,
-                        done_at: r.get(6)?,
+                        thread_id: r.get(5)?,
+                        created_at: r.get(6)?,
+                        done_at: r.get(7)?,
                     })
                 })?;
                 rows.collect()

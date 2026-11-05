@@ -43,7 +43,7 @@ async fn scene_setup_is_complete() {
     // contact), and the roster carries name + role only.
     assert_eq!(world.env.board_get("item:watch").await, None);
     let rules = world.env.rules_for("nobody").await;
-    assert_eq!(rules.len(), 2);
+    assert_eq!(rules.len(), 3);
     for id in &world.agents {
         assert_eq!(s.list_tasks(id, None).await.unwrap().len(), 0);
     }

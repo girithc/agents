@@ -55,10 +55,8 @@ impl DomainTool for SendOffer {
         if !price.is_finite() || price <= 0.0 {
             return Err(format!("invalid price {price}"));
         }
-        // The item must exist in this world.
-        if ctx.env.board_get(&format!("item:{item}")).await.is_none() {
-            return Err(format!("unknown item '{item}'"));
-        }
+        // Items are private (souls + memory), not board facts — no
+        // existence check; ownership is trust + house rules.
         let to_agent = ctx
             .store
             .get_agent(to)
@@ -74,26 +72,8 @@ impl DomainTool for SendOffer {
             .await
             .map_err(|e| e.to_string())?;
 
-        // The offer travels as a task; the board never holds offers.
-        ctx.store
-            .enqueue_task(
-                &to_agent.id,
-                &format!("offer: {item} @ ${price:.0}"),
-                &format!(
-                    "You were offered ${price:.0} for the {item} by {actor}. \
-                     Use send_offer to counter, or accept_deal to close.",
-                    price = price,
-                    item = item,
-                    actor = ctx.actor,
-                ),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-
-        // Item is in live negotiation.
-        ctx.env
-            .set_board(&format!("item:{item}"), &json!({"status": "pending", "last_price": price}))
-            .await;
+        // Fact only: the ledger row. The words ride talk_to in the same
+        // breath — one conversation, no duplicate words or task rows.
         Ok(json!({ "ok": true, "offered": price }))
     }
 }
@@ -134,43 +114,51 @@ impl DomainTool for AcceptDeal {
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("no agent '{with}'"))?;
 
-        // Ledger: the truth.
+        // THE transfer, atomically (base primitive): money and item swap
+        // hands in one transaction, or nothing moves. Roles are not
+        // hardcoded: whoever HOLDS the item is the seller, whoever holds
+        // the money pays.
+        let actor_owns_item = ctx
+            .store
+            .assets_of(ctx.actor)
+            .await
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|a| a.kind == "item" && a.name == item && a.qty >= 1.0);
+        let money = agenthub_storage::store::agent::AssetGive {
+            agent_id: if actor_owns_item { other.id.clone() } else { ctx.actor.to_string() },
+            kind: "money".into(),
+            name: "usd".into(),
+            qty: price,
+        };
+        let goods = agenthub_storage::store::agent::AssetGive {
+            agent_id: if actor_owns_item { ctx.actor.to_string() } else { other.id.clone() },
+            kind: "item".into(),
+            name: item.to_string(),
+            qty: 1.0,
+        };
         let payload = json!({
             "item": item, "party_a": ctx.actor, "party_b": other.id, "price": price
         });
         ctx.store
-            .append_change(&ctx.env.environment_id().to_string(), Some(ctx.actor), "deal", &payload.to_string())
-            .await
-            .map_err(|e| e.to_string())?;
-
-        // Board projection: item is gone. This write announces the sale to
-        // the item's subscribers (e.g. waking the buyer to go take it).
-        ctx.env
-            .set_board(&format!("item:{item}"), &json!({ "status": "sold", "last_price": price }))
-            .await;
-
-        // A closed deal ends the follow-up: both parties drop their
-        // subscription — the announcement above was already delivered.
-        let item_key = format!("item:{item}");
-        let _ = ctx.store.unsubscribe(&ctx.actor, &item_key).await;
-        let _ = ctx.store.unsubscribe(&other.id, &item_key).await;
-
-        // Notify the counterpart (their loop will think + settle).
-        ctx.store
-            .enqueue_task(
-                &other.id,
-                &format!("deal closed: {item} @ ${price:.0}"),
-                &format!(
-                    "{actor} closed the deal at ${price:.0} for the {item}. \
-                     Nothing to do — remember it and rest.",
-                    actor = ctx.actor,
-                    price = price,
-                    item = item,
-                ),
+            .exchange(
+                &ctx.env.environment_id().to_string(),
+                Some(ctx.actor),
+                "deal",
+                &payload.to_string(),
+                money,
+                goods,
             )
             .await
             .map_err(|e| e.to_string())?;
 
+        // Board projection (human audit only).
+        ctx.env
+            .set_board(&format!("item:{item}"), &json!({ "status": "sold", "last_price": price }))
+            .await;
+
+        // The thread's lifecycle is the AGENTS' choice (close_thread /
+        // leave_thread) — the deal is a fact, not a conversation-ender.
         Ok(json!({ "ok": true, "deal_price": price }))
     }
 }
@@ -195,6 +183,10 @@ impl Scene for TraderScene {
             .map_err(|e| e.to_string())?;
         store
             .add_rule(&env.id, None, "A deal is final only when closed with accept_deal.")
+            .await
+            .map_err(|e| e.to_string())?;
+        store
+            .add_rule(&env.id, None, "Either party may leave the negotiation at any time (leave_thread) — the other side is told and may leave too.")
             .await
             .map_err(|e| e.to_string())?;
 
@@ -224,6 +216,17 @@ impl Scene for TraderScene {
              Close with the send_offer/accept_deal handshake.",
         )
         .await?;
+
+        // Ownership, as base asset rows (the REAL state): the buyer holds
+        // $100, the seller holds the watch. Souls describe it; rows prove it.
+        store
+            .adjust_asset(&buyer, "money", "usd", 100.0)
+            .await
+            .map_err(|e| e.to_string())?;
+        store
+            .adjust_asset(&seller, "item", ITEM, 1.0)
+            .await
+            .map_err(|e| e.to_string())?;
 
         let env = agenthub_runtime::EnvHandle::new(store.clone(), env.id);
 

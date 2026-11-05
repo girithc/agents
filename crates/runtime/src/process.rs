@@ -96,7 +96,7 @@ async fn run(
     let model = tools.agent_model().to_string();
 
     let _ = store.set_state(&agent_id, AgentStatus::Idle, None, None).await;
-    tracing::info!(agent = %who, model = %model, "starts working");
+    tracing::info!(agent = %who, "{who} starts");
 
     // The agent is always either thinking or sleeping. `sleep_until` is the
     // current sleep's deadline; mail can interrupt any sleep.
@@ -137,21 +137,31 @@ async fn run(
                 match mail {
                     None | Some(Mail::Stop) => break,
                     Some(Mail::Task(_)) => {
-                        tracing::info!(agent = %who, model = %model, "got a task hint");
+                        tracing::info!(agent = %who, "{who} received a message");
                         let _ = store.set_state(&agent_id, AgentStatus::Idle, None, None).await;
+                        // An incoming message may be a reply inside an OPEN
+                        // thread — continue that negotiation (its task is
+                        // 'doing', not queued, and stays open until the
+                        // handshake closes it).
+                        let open = store.doing_thread_tasks(&agent_id).await.unwrap_or_default();
+                        for task in &open {
+                            let out = run_task(&store, brain.as_ref(), &tools, &env, task).await;
+                            requested_sleep = out.and_then(|o| o.sleep_ms);
+                        }
                         while let Some(task) = pop(&store, &agent_id).await {
                             let out = run_task(&store, brain.as_ref(), &tools, &env, &task).await;
                             requested_sleep = out.and_then(|o| o.sleep_ms);
                         }
                     }
                     Some(Mail::Message { from, body }) => {
-                        tracing::info!(agent = %who, model = %model, "got a message from {from}");
+                        let think_id = uuid::Uuid::new_v4().to_string();
+                        tools.set_think_tag(&think_id[..8]);
+                        tracing::info!(agent = %who, t = %think_id[..8].to_string(), "{who} received a message");
                         let _ = store.remember(
                             &agent_id,
                             MemoryKind::Event,
                             &format!("message from {from}: {body}"),
                         ).await;
-                        let think_id = uuid::Uuid::new_v4().to_string();
                         let span = tracing::info_span!(
                             "agent.think",
                             run_id = %think_id,
@@ -159,7 +169,8 @@ async fn run(
                             task_id = tracing::field::Empty,
                             task_title = "message",
                         );
-                        let ctx = think_ctx(&store, &env, &agent_id, &think_id, "message", &body).await;
+                        let ctx = think_ctx(&store, &env, &agent_id, &think_id, None, "message", &body).await;
+                        tools.set_current_thread(None, 0);
                         let outcome = run_think(&store, brain.as_ref(), &tools, &ctx, None, true)
                             .instrument(span)
                             .await;
@@ -181,14 +192,40 @@ async fn run(
                         requested_sleep = out.and_then(|o| o.sleep_ms);
                     }
                     None => {
-                        // No queued work is not "no self": hand the
-                        // microphone to the soul. This is how first
-                        // contact happens without seeds or broadcasts.
-                        let out = run_idle_think(&store, brain.as_ref(), &tools, &env).await;
-                        requested_sleep = out.as_ref().and_then(|o| o.sleep_ms);
-                        // An idle think that neither acted nor requested a
-                        // sleep earns the long nap, not the tick.
-                        idle_backoff = requested_sleep.is_none();
+                        // Waiting on a counterpart's reply anywhere? The mic
+                        // is theirs — nap, no model call. (Truth: threads,
+                        // not task statuses.)
+                        if store.waiting_on_reply(&agent_id).await.unwrap_or(false) {
+                            tracing::debug!(agent = %who, "waiting on their reply — mic stays theirs");
+                        } else {
+                            // An open thread with MY turn: continue the
+                            // conversation — the same think path a knock
+                            // uses. There is no "reconnect" move in the base.
+                            let open =
+                                store.doing_thread_tasks(&agent_id).await.unwrap_or_default();
+                            match open.first() {
+                                Some(t) => {
+                                    let out =
+                                        run_task(&store, brain.as_ref(), &tools, &env, t).await;
+                                    requested_sleep = out.and_then(|o| o.sleep_ms);
+                                }
+                                None => {
+                                    // Truly idle: first contact lives here.
+                                    let out = run_idle_think(
+                                        &store,
+                                        brain.as_ref(),
+                                        &tools,
+                                        &env,
+                                    )
+                                    .await;
+                                    idle_backoff = out
+                                        .as_ref()
+                                        .map(|o| o.sleep_ms.is_none())
+                                        .unwrap_or(true);
+                                    requested_sleep = out.and_then(|o| o.sleep_ms);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -252,21 +289,13 @@ async fn run_task(
         let _ = store
             .set_state(tools.agent_id(), AgentStatus::Thinking, Some(&task.id), None)
             .await;
-        let ctx = think_ctx(store, env, tools.agent_id(), &run_id, &task.title, &task.body).await;
+        let tag = &run_id[..8];
+        tools.set_think_tag(tag);
+        let ctx = think_ctx(store, env, tools.agent_id(), &run_id, Some(&task), &task.title, &task.body).await;
+        let count = ctx.thread.as_ref().map(|t| t.messages.len()).unwrap_or(0);
+        tools.set_current_thread(task.thread_id.as_deref(), count);
         let out = run_think(store, brain, tools, &ctx, Some(&task.id), true).await;
-        let note = out.as_ref().map(|o| o.note.clone()).unwrap_or_default();
-        let note = if note.chars().count() > 100 {
-            format!("{}...", note.chars().take(100).collect::<String>())
-        } else {
-            note
-        };
-        tracing::info!(
-            agent = %tools.agent_name(),
-            model = %tools.agent_model(),
-            kind = "finished",
-            thought = %note,
-            "finished"
-        );
+        tracing::info!(agent = %tools.agent_name(), t = %tag, "finished");
         out
     }
     .instrument(span)
@@ -288,10 +317,17 @@ async fn run_think(
             let _ = store
                 .remember(tools.agent_id(), MemoryKind::Reflection, &format!("think failed: {e}"))
                 .await;
-            // A failed think still closes its task (failed), so the queue
-            // never stalls on a stuck `doing` row.
+            // A failed think closes its task (failed) so the queue never
+            // stalls — EXCEPT open-thread tasks, which stay open to retry.
             if let Some(id) = task_id {
-                let _ = store.finish_task(id, false).await;
+                let task = store.get_task(id).await.ok().flatten();
+                let thread_open = match task.as_ref().and_then(|t| t.thread_id.as_deref()) {
+                    Some(tid) => store.thread_open(tid).await.unwrap_or(false),
+                    None => false,
+                };
+                if !thread_open {
+                    let _ = store.finish_task(id, false).await;
+                }
             }
             return None;
         }
@@ -302,7 +338,16 @@ async fn run_think(
             .await;
     }
     if let Some(id) = task_id {
-        let _ = store.finish_task(id, outcome.ok).await;
+        // Thread tasks stay open while their thread is open — the agents
+        // (close_thread/leave_thread/handshake) end them, not the loop.
+        let task = store.get_task(id).await.ok().flatten();
+        let thread_open = match task.as_ref().and_then(|t| t.thread_id.as_deref()) {
+            Some(tid) => store.thread_open(tid).await.unwrap_or(false),
+            None => false,
+        };
+        if !thread_open {
+            let _ = store.finish_task(id, outcome.ok).await;
+        }
     }
     Some(outcome)
 }
@@ -323,19 +368,54 @@ async fn run_idle_think(
         run_id = %run_id,
         agent = %tools.agent_id(),
         task_id = tracing::field::Empty,
-        task_title = "own initiative",
+        task_title = "self-started",
     );
     async move {
+        // If the agent is mid-negotiation, the initiative think sees that
+        // thread's transcript — any follow-up continues it; it never
+        // re-pitches from scratch.
+        let open_thread_task = store
+            .doing_thread_tasks(tools.agent_id())
+            .await
+            .unwrap_or_default()
+            .first()
+            .cloned();
+        tools.set_think_tag(&run_id[..8]);
+        let (tid, cnt) = match &open_thread_task {
+            Some(t) => match &t.thread_id {
+                Some(id) => (Some(id.as_str()), store.thread_messages(id).await.unwrap_or_default().len()),
+                None => (None, 0),
+            },
+            None => (None, 0),
+        };
+        tools.set_current_thread(tid, cnt);
+        let (title, body) = match &open_thread_task {
+            Some(t) => (
+                t.title.as_str(),
+                format!(
+                    "You are mid-negotiation (thread open). Last thing you knew: {}. \
+                     If waiting on their reply is right, call sleep. Otherwise follow up ONCE, \
+                     with the full conversation so far in mind — do not start over.",
+                    t.body
+                ),
+            ),
+            None => (
+                "self-started",
+                "Nothing is queued for you right now. Consult your soul and goal: \
+                 if there is anything you should be doing — start work, approach \
+                 someone, follow up — act now with your tools. If there is truly \
+                 nothing to do, call sleep."
+                    .into(),
+            ),
+        };
         let ctx = think_ctx(
             store,
             env,
             tools.agent_id(),
             &run_id,
-            "own initiative",
-            "Nothing is queued for you right now. Consult your soul and goal: \
-             if there is anything you should be doing — start work, approach \
-             someone, follow up — act now with your tools. If there is truly \
-             nothing to do, call sleep.",
+            open_thread_task.as_ref(),
+            title,
+            &body,
         )
         .await;
         match brain.think(&ctx, tools).await {
@@ -347,9 +427,9 @@ async fn run_idle_think(
                 tracing::info!(
                     agent = %tools.agent_name(),
                     model = %tools.agent_model(),
-                    kind = "idle",
+                    kind = "finished",
                     thought = %out.note,
-                    "own initiative"
+                    "finished"
                 );
                 Some(out)
             }
@@ -364,6 +444,7 @@ async fn think_ctx(
     env: &EnvHandle,
     agent_id: &str,
     run_id: &str,
+    task: Option<&AgentTask>,
     task_title: &str,
     task_body: &str,
 ) -> ThinkCtx {
@@ -371,9 +452,47 @@ async fn think_ctx(
         Some(s) => (s.soul, s.goal),
         None => (String::new(), String::new()),
     };
+    // The roster is world data — pushed into every think, never re-polled.
+    // The flag marks who they ALREADY talk to (open thread between us):
+    // no re-approaching them.
+    let mut roster = Vec::new();
+    for a in store.list_agents().await.unwrap_or_default() {
+        if a.id == agent_id {
+            continue;
+        }
+        let talking = store
+            .thread_between(agent_id, &a.id)
+            .await
+            .map(|t| t.is_some())
+            .unwrap_or(false);
+        roster.push((a.name, a.role, talking));
+    }
+    // The thread transcript, when this task belongs to a conversation.
+    let thread = match task.and_then(|t| t.thread_id.clone()) {
+        Some(tid) => {
+            let msgs = store.thread_messages(&tid).await.unwrap_or_default();
+            let mut view = Vec::new();
+            for m in msgs {
+                let who = store
+                    .get_agent(&m.sender)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|a| a.name)
+                    .unwrap_or_else(|| m.sender.clone());
+                view.push((who, m.body));
+            }
+            Some(crate::brain::ThreadView { id: tid, messages: view })
+        }
+        None => None,
+    };
+    let assets = store.assets_of(agent_id).await.unwrap_or_default();
     ThinkCtx {
         agent_id: agent_id.to_string(),
         run_id: run_id.to_string(),
+        roster,
+        thread,
+        assets,
         task_title: task_title.to_string(),
         task_body: task_body.to_string(),
         soul,

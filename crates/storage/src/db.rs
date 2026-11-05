@@ -101,10 +101,43 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
     title      TEXT NOT NULL,
     body       TEXT NOT NULL DEFAULT '',
     status     TEXT NOT NULL DEFAULT 'queued',
+    thread_id  TEXT,
     created_at INTEGER NOT NULL,
     done_at    INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_agent ON agent_tasks(agent_id, status);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_thread ON agent_tasks(thread_id);
+
+-- Negotiation threads: one open thread per (pair of) deal-in-progress.
+-- Each party keeps their OWN task row (thread_id links them); the spoken
+-- words are the shared part and live in agent_messages.
+CREATE TABLE IF NOT EXISTS agent_threads (
+    thread_id      TEXT PRIMARY KEY,
+    environment_id TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'open',
+    -- Whose words come next (agent id). NULL = nobody spoke yet.
+    turn           TEXT,
+    created_at     INTEGER NOT NULL,
+    closed_at      INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS agent_assets (
+    agent_id  TEXT NOT NULL,
+    kind      TEXT NOT NULL DEFAULT 'money',
+    name      TEXT NOT NULL,
+    qty       REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (agent_id, kind, name)
+);
+
+CREATE TABLE IF NOT EXISTS agent_messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id  TEXT NOT NULL,
+    sender     TEXT NOT NULL,
+    recipient  TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_messages_thread ON agent_messages(thread_id);
 
 CREATE TABLE IF NOT EXISTS agent_memory (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,6 +231,8 @@ impl Db {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         Self::migrate_trace_tables(&conn)?;
+        Self::migrate_agent_columns(&conn)?;
+        Self::migrate_thread_columns(&conn)?;
         // Databases created before agents had a role: add the column. A
         // duplicate-column error means it's already there — fine.
         let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN role TEXT NOT NULL DEFAULT ''");
@@ -205,6 +240,32 @@ impl Db {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// Older databases lack the thread `turn` column.
+    fn migrate_thread_columns(conn: &Connection) -> Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(agent_threads)")?;
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        if !cols.iter().any(|c| c == "turn") {
+            conn.execute_batch("ALTER TABLE agent_threads ADD COLUMN turn TEXT")?;
+        }
+        Ok(())
+    }
+
+    /// Older databases lack the `agent_tasks.thread_id` column.
+    fn migrate_agent_columns(conn: &Connection) -> Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(agent_tasks)")?;
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        if !cols.iter().any(|c| c == "thread_id") {
+            conn.execute_batch("ALTER TABLE agent_tasks ADD COLUMN thread_id TEXT")?;
+        }
+        Ok(())
     }
 
     /// The one-shot run engine was removed; its tables are orphaned.
@@ -259,6 +320,29 @@ impl Db {
         match res {
             Ok(inner) => inner,
             Err(join_err) => Err(StorageError::Crypto(format!("db task join: {join_err}"))),
+        }
+    }
+
+    /// Like [`Db::exec`] but the closure returns any error type built from
+    /// [`StorageError`] — for domain failures (e.g. insufficient assets)
+    /// that must not be masqueraded as SQL errors.
+    pub async fn exec_any<T, E, F>(&self, f: F) -> std::result::Result<T, E>
+    where
+        T: Send + 'static,
+        E: Send + 'static + From<StorageError>,
+        F: FnOnce(&Connection) -> std::result::Result<T, E> + Send + 'static,
+    {
+        let conn = self.conn.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            let guard = conn
+                .lock()
+                .map_err(|_| StorageError::Crypto("db connection mutex poisoned".into()))?;
+            f(&guard)
+        })
+        .await;
+        match res {
+            Ok(inner) => inner,
+            Err(join_err) => Err(StorageError::Crypto(format!("db task join: {join_err}")).into()),
         }
     }
 }
