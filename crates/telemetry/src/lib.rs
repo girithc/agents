@@ -101,7 +101,7 @@ where
         event.record(&mut p);
 
         // Correlation id: binds every line from one think.
-        let tag = p.rest.get("t").cloned().unwrap_or_default();
+        let tag = p.rest.iter().find(|(k, _)| k == "t").map(|(_, v)| v.clone()).unwrap_or_default();
         match (&p.agent, &p.model) {
             (Some(agent), _) => {
                 if tag.is_empty() {
