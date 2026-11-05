@@ -108,6 +108,10 @@ impl Store {
         self.get_task(&popped).await
     }
 
+    /// Close a task. Tasks and threads are tightly coupled: deliberately
+    /// finishing a thread task (ok = the agent's choice) closes the thread
+    /// and settles the counterpart's task too. A FAILED task closes only
+    /// itself — the thread stays open for retry.
     pub async fn finish_task(&self, task_id: &str, ok: bool) -> Result<()> {
         let (id, status, now) = (
             task_id.to_string(),
@@ -120,6 +124,26 @@ impl Store {
                     "UPDATE agent_tasks SET status=?2, done_at=?3 WHERE id=?1",
                     params![id, status, now],
                 )?;
+                if ok {
+                    let thread_id: Option<String> = c
+                        .query_row(
+                            "SELECT thread_id FROM agent_tasks WHERE id=?1",
+                            params![id],
+                            |r| r.get(0),
+                        )?;
+                    if let Some(tid) = thread_id {
+                        c.execute(
+                            "UPDATE agent_threads SET status='closed', turn=NULL, closed_at=?2 \
+                             WHERE thread_id=?1 AND status='open'",
+                            params![tid, now],
+                        )?;
+                        c.execute(
+                            "UPDATE agent_tasks SET status='done', done_at=?2 \
+                             WHERE thread_id=?1 AND status IN ('queued','doing')",
+                            params![tid, now],
+                        )?;
+                    }
+                }
                 Ok(())
             })
             .await

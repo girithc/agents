@@ -11,6 +11,10 @@ use crate::process::Mail;
 #[derive(Debug, Clone)]
 pub struct ThreadView {
     pub id: String,
+    /// open | closed — is this conversation still live?
+    pub status: String,
+    /// Whose words come next (name), if anyone's.
+    pub turn: Option<String>,
     /// The transcript so far: (sender name, words), oldest first.
     pub messages: Vec<(String, String)>,
 }

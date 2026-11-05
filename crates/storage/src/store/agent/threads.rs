@@ -196,6 +196,34 @@ impl Store {
             .await
     }
 
+    /// Every message in every thread of a world (for live UIs/feeds).
+    pub async fn messages_in_world(
+        &self,
+        environment_id: &str,
+    ) -> Result<Vec<ThreadMessage>> {
+        let eid = environment_id.to_string();
+        self.db
+            .exec(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT m.id, m.thread_id, m.sender, m.recipient, m.body, m.created_at \
+                     FROM agent_messages m JOIN agent_threads t ON t.thread_id = m.thread_id \
+                     WHERE t.environment_id = ?1 ORDER BY m.id",
+                )?;
+                let rows = stmt.query_map(params![eid], |r| {
+                    Ok(ThreadMessage {
+                        id: r.get(0)?,
+                        thread_id: r.get(1)?,
+                        sender: r.get(2)?,
+                        recipient: r.get(3)?,
+                        body: r.get(4)?,
+                        created_at: r.get(5)?,
+                    })
+                })?;
+                rows.collect()
+            })
+            .await
+    }
+
     /// The full transcript, oldest first.
     pub async fn thread_messages(&self, thread_id: &str) -> Result<Vec<ThreadMessage>> {
         let id = thread_id.to_string();
@@ -281,8 +309,9 @@ impl Store {
             .await
     }
 
-    /// An agent's still-open task for a thread (it's 'doing' — thinking
-    /// happened, thread not closed yet).
+    /// An agent's still-open task for a thread: 'queued' OR 'doing' —
+    /// a queued one is still open, and missing it would create a
+    /// duplicate task for the same thread.
     pub async fn open_task_for_thread(
         &self,
         agent_id: &str,
@@ -294,7 +323,8 @@ impl Store {
             .exec(move |c| {
                 c.query_row(
                     "SELECT id, agent_id, title, body, status, thread_id, created_at, done_at \
-                     FROM agent_tasks WHERE agent_id = ?1 AND thread_id = ?2 AND status = 'doing' LIMIT 1",
+                     FROM agent_tasks WHERE agent_id = ?1 AND thread_id = ?2 \
+                     AND status IN ('queued','doing') LIMIT 1",
                     params![aid, tid],
                     |r| {
                         let status: String = r.get(4)?;
@@ -446,6 +476,12 @@ mod tests {
 mod turn_tests {
     use super::*;
 
+    async fn store() -> Store {
+        let dir = std::env::temp_dir().join(format!("agenthub-test-{}", uuid::Uuid::new_v4()));
+        Store::open(&dir.join("test.db"), crate::Vault::open(&dir.join("master.key")).unwrap())
+            .expect("open store")
+    }
+
     #[tokio::test]
     async fn greeting_flips_turn_and_marks_greeter_waiting() {
         let s = store().await;
@@ -480,5 +516,20 @@ mod turn_tests {
             .await
             .unwrap();
         assert!(sneaky.is_err(), "off-turn send must bounce");
+
+        // TIGHT COUPLING: one party finishing their task closes the thread
+        // and settles the counterpart's task.
+        let my_task = s
+            .enqueue_task_in_thread("buyer", "talking with seller", "x", &tid)
+            .await
+            .unwrap();
+        let their_task = s
+            .enqueue_task_in_thread("seller", "talking with buyer", "x", &tid)
+            .await
+            .unwrap();
+        s.finish_task(&my_task.id, true).await.unwrap();
+        assert!(!s.thread_open(&tid).await.unwrap(), "task closure closes thread");
+        let settled = s.get_task(&their_task.id).await.unwrap().unwrap();
+        assert_eq!(settled.status, crate::store::agent::AgentTaskStatus::Done);
     }
 }

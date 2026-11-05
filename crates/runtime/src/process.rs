@@ -93,10 +93,9 @@ async fn run(
     let AgentDeps { store, env, agent_id } = deps;
     let tools = AgentTools::new(store.clone(), env.clone(), agent_id.clone()).await;
     let who = tools.agent_name().to_string();
-    let model = tools.agent_model().to_string();
 
     let _ = store.set_state(&agent_id, AgentStatus::Idle, None, None).await;
-    tracing::info!(agent = %who, "{who} starts");
+    tracing::info!(agent = %who, "starts");
 
     // The agent is always either thinking or sleeping. `sleep_until` is the
     // current sleep's deadline; mail can interrupt any sleep.
@@ -156,7 +155,7 @@ async fn run(
                     Some(Mail::Message { from, body }) => {
                         let think_id = uuid::Uuid::new_v4().to_string();
                         tools.set_think_tag(&think_id[..8]);
-                        tracing::info!(agent = %who, t = %think_id[..8].to_string(), "{who} received a message");
+                        tracing::info!(agent = %who, t = %think_id[..8].to_string(), "received a message");
                         let _ = store.remember(
                             &agent_id,
                             MemoryKind::Event,
@@ -250,7 +249,7 @@ async fn run(
 
     let _ = store.set_state(&agent_id, AgentStatus::Stopped, None, None).await;
     env.phonebook().remove(&agent_id); // delist: no more knocks
-    tracing::info!(agent = %who, model = %model, "stopped");
+    tracing::info!(agent = %who, "stopped");
 }
 
 async fn pop(store: &Arc<Store>, agent_id: &str) -> Option<AgentTask> {
@@ -420,13 +419,12 @@ async fn run_idle_think(
         .await;
         match brain.think(&ctx, tools).await {
             Err(e) => {
-                tracing::warn!(agent = %tools.agent_name(), model = %tools.agent_model(), error = %e, "idle think failed");
+                tracing::warn!(agent = %tools.agent_name(), error = %e, "idle think failed");
                 None
             }
             Ok(out) => {
                 tracing::info!(
                     agent = %tools.agent_name(),
-                    model = %tools.agent_model(),
                     kind = "finished",
                     thought = %out.note,
                     "finished"
@@ -470,6 +468,25 @@ async fn think_ctx(
     // The thread transcript, when this task belongs to a conversation.
     let thread = match task.and_then(|t| t.thread_id.clone()) {
         Some(tid) => {
+            let status = if store.thread_open(&tid).await.unwrap_or(false) {
+                "open".to_string()
+            } else {
+                "closed".to_string()
+            };
+            let turn_id = store.thread_turn(&tid).await.ok().flatten();
+            let turn = match turn_id {
+                Some(id) => {
+                    let name = store
+                        .get_agent(&id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|a| a.name)
+                        .unwrap_or_else(|| id.clone());
+                    Some(name)
+                }
+                None => None,
+            };
             let msgs = store.thread_messages(&tid).await.unwrap_or_default();
             let mut view = Vec::new();
             for m in msgs {
@@ -482,7 +499,7 @@ async fn think_ctx(
                     .unwrap_or_else(|| m.sender.clone());
                 view.push((who, m.body));
             }
-            Some(crate::brain::ThreadView { id: tid, messages: view })
+            Some(crate::brain::ThreadView { id: tid, status, turn, messages: view })
         }
         None => None,
     };

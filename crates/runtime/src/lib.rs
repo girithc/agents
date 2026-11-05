@@ -18,10 +18,10 @@ mod tests;
 
 pub use brain::{AgentTools, Brain, ThinkCtx, ThinkOutcome};
 pub use env::EnvHandle;
-pub use llm_brain::{dispatch_tool, tool_specs, LlmBrain};
+pub use llm_brain::{base_tools, dispatch_tool, LlmBrain};
 pub use phonebook::Phonebook;
 pub use process::{spawn_agent_loop, AgentDeps, AgentHandle, Mail};
-pub use scene::{DomainCtx, DomainTool, Scene, SceneWorld};
+pub use scene::{Scene, SceneWorld, Tool};
 pub use supervisor::Supervisor;
 
 /// Read MODEL_API_KEY from env or ./.env (first match wins).

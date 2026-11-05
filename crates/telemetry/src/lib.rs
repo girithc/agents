@@ -37,6 +37,7 @@ struct LineParts {
     agent: Option<String>,
     model: Option<String>,
     thought: Option<String>,
+    kind: Option<String>,
     rest: Vec<(String, String)>,
 }
 
@@ -47,7 +48,7 @@ impl LineParts {
             "agent" => self.agent = Some(value),
             "model" => self.model = Some(value),
             "thought" => self.thought = Some(value),
-            "kind" => {}
+            "kind" => self.kind = Some(value),
             other => self.rest.push((other.to_string(), value)),
         }
     }
@@ -81,6 +82,16 @@ where
         mut writer: FmtWriter<'_>,
         event: &Event<'_>,
     ) -> fmt::Result {
+        let level = event.metadata().level();
+        let severe = matches!(*level, tracing::Level::ERROR | tracing::Level::WARN);
+        let mut p = LineParts::default();
+        event.record(&mut p);
+
+        // Full model I/O lives in SQLite only — never on the console.
+        if p.kind.as_deref() == Some("model_seen") || p.kind.as_deref() == Some("model_said") {
+            return Ok(());
+        }
+
         // Clock time only: HH:MM:SS.
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -94,11 +105,6 @@ where
             (tod % 3600) / 60,
             tod % 60
         )?;
-
-        let level = event.metadata().level();
-        let severe = matches!(*level, tracing::Level::ERROR | tracing::Level::WARN);
-        let mut p = LineParts::default();
-        event.record(&mut p);
 
         // Correlation id: binds every line from one think.
         let tag = p.rest.iter().find(|(k, _)| k == "t").map(|(_, v)| v.clone()).unwrap_or_default();

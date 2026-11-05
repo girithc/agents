@@ -11,23 +11,20 @@ use agenthub_storage::Store;
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::brain::AgentTools;
 use crate::env::EnvHandle;
 use agenthub_providers::ToolSpec;
 
-/// What a domain tool may touch: the store, the environment, and who is
-/// calling. Domain tools are the ONLY things allowed to write the board
-/// and append to the ledger.
-pub struct DomainCtx<'a> {
-    pub store: &'a Store,
-    pub env: &'a EnvHandle,
-    /// Calling agent's id.
-    pub actor: &'a str,
-}
-
 #[async_trait]
-pub trait DomainTool: Send + Sync {
+pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
-    async fn call(&self, args: &Value, ctx: &DomainCtx<'_>) -> Result<Value, String>;
+    async fn call(&self, args: &Value, ctx: &AgentTools) -> Result<Value, String>;
+    /// Plain-words line for the log (≤3 words), from the tool itself.
+    fn describe(&self, result: &Value) -> String;
+    /// Terminal tools end the current think when called (e.g. sleep).
+    fn is_terminal(&self) -> bool {
+        false
+    }
 }
 
 /// A finished product: a world definition. `setup` writes all rows
@@ -41,7 +38,7 @@ pub trait Scene {
     async fn setup(&self, store: &Arc<Store>) -> Result<SceneWorld, String>;
 
     /// The verbs available in this world (granted per-agent in setup).
-    fn domain_tools(&self) -> Vec<Arc<dyn DomainTool>>;
+    fn domain_tools(&self) -> Vec<Arc<dyn Tool>>;
 }
 
 #[derive(Debug, Clone)]

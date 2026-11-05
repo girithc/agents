@@ -15,7 +15,7 @@ use agenthub_storage::store::agent::AgentTaskStatus;
 use agenthub_storage::{NewAgent, Store, Vault};
 
 use crate::env::EnvHandle;
-use crate::llm_brain::{LlmBrain, dispatch_tool};
+use crate::llm_brain::{base_tools, dispatch_tool, LlmBrain};
 use crate::process::{spawn_agent_loop, AgentDeps};
 use crate::supervisor::Supervisor;
 
@@ -238,7 +238,7 @@ async fn dispatch_sleep_tool_requests_sleep() {
         name: "sleep".into(),
         arguments: serde_json::json!({ "seconds": 50 }),
     };
-    let out = dispatch_tool(&call, &tools, &[]).await;
+    let out = dispatch_tool(&call, &tools, &base_tools()).await;
     assert!(out.contains("\"ok\":true"));
     assert_eq!(tools.take_sleep_request(), Some(50_000));
 }
@@ -255,7 +255,7 @@ async fn dispatch_remember_then_recall() {
         name: "remember".into(),
         arguments: serde_json::json!({ "content": "the vault code is 1234" }),
     };
-    let out = dispatch_tool(&remember, &tools, &[]).await;
+    let out = dispatch_tool(&remember, &tools, &base_tools()).await;
     assert!(out.contains("\"ok\":true"));
 
     let recall = agenthub_providers::ToolCall {
@@ -263,7 +263,7 @@ async fn dispatch_remember_then_recall() {
         name: "recall".into(),
         arguments: serde_json::json!({ "query": "vault code" }),
     };
-    let out = dispatch_tool(&recall, &tools, &[]).await;
+    let out = dispatch_tool(&recall, &tools, &base_tools()).await;
     assert!(out.contains("vault code"));
 }
 

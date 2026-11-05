@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use agenthub_providers::ToolSpec;
-use agenthub_runtime::{DomainCtx, DomainTool, Scene, SceneWorld};
+use agenthub_runtime::{AgentTools, Scene, SceneWorld, Tool};
 use agenthub_storage::{NewAgent, Store};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -30,7 +30,7 @@ const SELLER: &str = "seller";
 pub struct SendOffer;
 
 #[async_trait]
-impl DomainTool for SendOffer {
+impl Tool for SendOffer {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "send_offer".into(),
@@ -48,7 +48,13 @@ impl DomainTool for SendOffer {
         }
     }
 
-    async fn call(&self, args: &Value, ctx: &DomainCtx<'_>) -> Result<Value, String> {
+    fn describe(&self, result: &Value) -> String {
+        let err = result.get("error").and_then(Value::as_str)
+            .map(|e| format!(" (failed: {e})")).unwrap_or_default();
+        format!("offered ${:.0}{err}", result.get("offered").and_then(Value::as_f64).unwrap_or(0.0))
+    }
+
+    async fn call(&self, args: &Value, ctx: &AgentTools) -> Result<Value, String> {
         let to = args.get("to").and_then(Value::as_str).ok_or("missing 'to'")?;
         let item = args.get("item").and_then(Value::as_str).ok_or("missing 'item'")?;
         let price = args.get("price").and_then(Value::as_f64).ok_or("missing 'price'")?;
@@ -58,17 +64,17 @@ impl DomainTool for SendOffer {
         // Items are private (souls + memory), not board facts — no
         // existence check; ownership is trust + house rules.
         let to_agent = ctx
-            .store
+            .store()
             .get_agent(to)
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("no agent '{to}'"))?;
 
         let payload = json!({
-            "item": item, "from": ctx.actor, "to": to_agent.id, "price": price
+            "item": item, "from": ctx.agent_id(), "to": to_agent.id, "price": price
         });
-        ctx.store
-            .append_change(&ctx.env.environment_id().to_string(), Some(ctx.actor), "offer_made", &payload.to_string())
+        ctx.store()
+            .append_change(&ctx.env().environment_id().to_string(), Some(ctx.agent_id()), "offer_made", &payload.to_string())
             .await
             .map_err(|e| e.to_string())?;
 
@@ -83,7 +89,7 @@ impl DomainTool for SendOffer {
 pub struct AcceptDeal;
 
 #[async_trait]
-impl DomainTool for AcceptDeal {
+impl Tool for AcceptDeal {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "accept_deal".into(),
@@ -91,16 +97,24 @@ impl DomainTool for AcceptDeal {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "with":  { "type": "string", "description": "counterpart agent name" },
-                    "item":  { "type": "string" },
-                    "price": { "type": "number" }
+                    "with":   { "type": "string", "description": "counterpart agent name" },
+                    "item":   { "type": "string" },
+                    "price":  { "type": "number" },
+                    "i_give": { "type": "string", "enum": ["money", "item"],
+                                "description": "what YOU hand over: money (you're buying) or item (you're selling) — per your own soul" }
                 },
-                "required": ["with", "item", "price"]
+                "required": ["with", "item", "price", "i_give"]
             }),
         }
     }
 
-    async fn call(&self, args: &Value, ctx: &DomainCtx<'_>) -> Result<Value, String> {
+    fn describe(&self, result: &Value) -> String {
+        let err = result.get("error").and_then(Value::as_str)
+            .map(|e| format!(" (failed: {e})")).unwrap_or_default();
+        format!("deal closed: ${:.0}{err}", result.get("deal_price").and_then(Value::as_f64).unwrap_or(0.0))
+    }
+
+    async fn call(&self, args: &Value, ctx: &AgentTools) -> Result<Value, String> {
         let with = args.get("with").and_then(Value::as_str).ok_or("missing 'with'")?;
         let item = args.get("item").and_then(Value::as_str).ok_or("missing 'item'")?;
         let price = args.get("price").and_then(Value::as_f64).ok_or("missing 'price'")?;
@@ -108,52 +122,61 @@ impl DomainTool for AcceptDeal {
             return Err(format!("invalid price {price}"));
         }
         let other = ctx
-            .store
+            .store()
             .get_agent(with)
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("no agent '{with}'"))?;
 
-        // THE transfer, atomically (base primitive): money and item swap
-        // hands in one transaction, or nothing moves. Roles are not
-        // hardcoded: whoever HOLDS the item is the seller, whoever holds
-        // the money pays.
-        let actor_owns_item = ctx
-            .store
-            .assets_of(ctx.actor)
+        // THE transfer, atomically (base primitive). The tool is STATELESS:
+        // the caller declares what THEY give (their soul knows who they
+        // are); the counterpart gives the complement. Nothing is inferred.
+        let i_give = args.get("i_give").and_then(Value::as_str).ok_or("missing 'i_give' (money or item)?")?;
+        let (i_give_kind, i_give_name, i_give_qty, their_kind, their_name, their_qty) = match i_give {
+            "money" => ("money", "usd", price, "item", item, 1.0),
+            "item" => ("item", item, 1.0, "money", "usd", price),
+            other => return Err(format!("i_give must be 'money' or 'item', got '{other}'")),
+        };
+        let my_give = agenthub_storage::store::agent::AssetGive {
+            agent_id: ctx.agent_id().to_string(),
+            kind: i_give_kind.into(),
+            name: i_give_name.into(),
+            qty: i_give_qty,
+        };
+        let their_give = agenthub_storage::store::agent::AssetGive {
+            agent_id: other.id.clone(),
+            kind: their_kind.into(),
+            name: their_name.into(),
+            qty: their_qty,
+        };
+        // Idempotence guard: if the watch already sold, refuse — a repeated
+        // accept_deal must not run the trade backwards.
+        let already_sold = ctx
+            .env()
+            .board_get(&format!("item:{item}"))
             .await
-            .map_err(|e| e.to_string())?
-            .iter()
-            .any(|a| a.kind == "item" && a.name == item && a.qty >= 1.0);
-        let money = agenthub_storage::store::agent::AssetGive {
-            agent_id: if actor_owns_item { other.id.clone() } else { ctx.actor.to_string() },
-            kind: "money".into(),
-            name: "usd".into(),
-            qty: price,
-        };
-        let goods = agenthub_storage::store::agent::AssetGive {
-            agent_id: if actor_owns_item { ctx.actor.to_string() } else { other.id.clone() },
-            kind: "item".into(),
-            name: item.to_string(),
-            qty: 1.0,
-        };
+            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(|s| s == "sold"))
+            .unwrap_or(false);
+        if already_sold {
+            return Err(format!("the {item} is already sold — nothing to accept"));
+        }
         let payload = json!({
-            "item": item, "party_a": ctx.actor, "party_b": other.id, "price": price
+            "item": item, "party_a": ctx.agent_id(), "party_b": other.id, "price": price
         });
-        ctx.store
+        ctx.store()
             .exchange(
-                &ctx.env.environment_id().to_string(),
-                Some(ctx.actor),
+                &ctx.env().environment_id().to_string(),
+                Some(ctx.agent_id()),
                 "deal",
                 &payload.to_string(),
-                money,
-                goods,
+                my_give,
+                their_give,
             )
             .await
             .map_err(|e| e.to_string())?;
 
         // Board projection (human audit only).
-        ctx.env
+        ctx.env()
             .set_board(&format!("item:{item}"), &json!({ "status": "sold", "last_price": price }))
             .await;
 
@@ -187,6 +210,10 @@ impl Scene for TraderScene {
             .map_err(|e| e.to_string())?;
         store
             .add_rule(&env.id, None, "Either party may leave the negotiation at any time (leave_thread) — the other side is told and may leave too.")
+            .await
+            .map_err(|e| e.to_string())?;
+        store
+            .add_rule(&env.id, None, "When a deal is closed (accept_deal succeeded), say goodbye and end the conversation with close_thread.")
             .await
             .map_err(|e| e.to_string())?;
 
@@ -231,7 +258,7 @@ impl Scene for TraderScene {
         let env = agenthub_runtime::EnvHandle::new(store.clone(), env.id);
 
         // Verbs: register + grant to both roles.
-        for t in [&SendOffer as &dyn DomainTool, &AcceptDeal as &dyn DomainTool] {
+        for t in [&SendOffer as &dyn Tool, &AcceptDeal as &dyn Tool] {
             let spec = t.spec();
             store
                 .register_tool(&spec.name, agenthub_storage::store::agent::ToolKind::Builtin, "{}")
@@ -248,10 +275,11 @@ impl Scene for TraderScene {
         })
     }
 
-    fn domain_tools(&self) -> Vec<Arc<dyn DomainTool>> {
+    fn domain_tools(&self) -> Vec<Arc<dyn Tool>> {
         vec![Arc::new(SendOffer), Arc::new(AcceptDeal)]
     }
 }
+
 
 async fn agent(store: &Arc<Store>, name: &str, role: &str, soul: &str) -> Result<String, String> {
     let a = store

@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use std::panic::AssertUnwindSafe;
 
 use crate::brain::{AgentTools, Brain, ThinkCtx, ThinkOutcome};
-use crate::scene::{DomainCtx, DomainTool};
+use crate::scene::Tool;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -30,7 +30,7 @@ pub struct LlmBrain {
     pub max_iterations: u32,
     pub timeout: Duration,
     /// Scene verbs, tried before the personal toolset.
-    domain_tools: Vec<Arc<dyn DomainTool>>,
+    domain_tools: Vec<Arc<dyn Tool>>,
 }
 
 impl LlmBrain {
@@ -45,7 +45,7 @@ impl LlmBrain {
     }
 
     /// Give this brain the scene's domain tools.
-    pub fn with_domain_tools(mut self, tools: Vec<Arc<dyn DomainTool>>) -> Self {
+    pub fn with_domain_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.domain_tools = tools;
         self
     }
@@ -56,7 +56,7 @@ impl LlmBrain {
         provider: Arc<dyn Provider>,
         mut req: CompletionRequest,
         tools: &AgentTools,
-        domain: &[Arc<dyn DomainTool>],
+        all: &[Arc<dyn Tool>],
     ) -> Result<String, String> {
         for _ in 0..self.max_iterations {
             let resp = {
@@ -79,6 +79,15 @@ impl LlmBrain {
                 }
             }?;
 
+            // Full model I/O — persisted as trace events on this think's
+            // run_id: what the model SAW and what it DID with it.
+            let rid = req.run_id.clone().unwrap_or_default();
+            tracing::info!(run_id = %rid, kind = "model_seen", messages = %serde_json::to_string(&req.messages).unwrap_or_default(), "model input");
+            tracing::info!(run_id = %rid, kind = "model_said",
+                text = %resp.text,
+                tools = %serde_json::to_string(&resp.tool_calls).unwrap_or_default(),
+                "model output");
+
             if resp.tool_calls.is_empty() {
                 return Ok(resp.text);
             }
@@ -89,24 +98,12 @@ impl LlmBrain {
             let mut messages = req.messages.clone();
             messages.push(assistant);
             for call in &resp.tool_calls {
-                let result = dispatch_tool(call, tools, domain).await;
+                let result = dispatch_tool(call, tools, all).await;
                 tracing::debug!(agent = %tools.agent_id(), tool = %call.name, "tool result: {result}");
-                // One governance line per tool use: who[model] did what[why].
-                // The reasoning summary is the model's stated "why" this round.
-                let said = friendly_line(call, &result);
-                let thought = resp.reasoning.clone().unwrap_or_default();
-                tracing::info!(
-                    agent = %tools.agent_name(),
-                    model = %req.model,
-                    kind = "action",
-                    thought = %thought,
-                    "{said}"
-                );
                 messages.push(ChatMessage::tool(call.id.clone(), result));
 
-                // `sleep` is terminal: going to sleep ends the turn —
-                // no further model round, otherwise the model loops.
-                if call.name == "sleep" {
+                // Terminal tools (sleep) end the turn — no further round.
+                if all.iter().any(|t| t.spec().name == call.name && t.is_terminal()) {
                     let note = if resp.text.is_empty() { "[going to sleep]".to_string() } else { resp.text };
                     return Ok(note);
                 }
@@ -119,175 +116,126 @@ impl LlmBrain {
 
 // ---------------------------------------------------------------- toolset
 
-/// The personal toolset every LLM brain gets. Domain tools (cut_meat,
-/// charge_customer, ...) are added per agent later.
-pub fn tool_specs() -> Vec<ToolSpec> {
-    let obj = |props: Value, required: &[&str]| {
-        json!({ "type": "object", "properties": props, "required": required })
-    };
+/// The base organ tools — every agent has them. Each owns its spec, its
+/// effect, and its own display phrase. Scene tools implement the same
+/// standard trait; the base knows none of them by name.
+pub fn base_tools() -> Vec<Arc<dyn Tool>> {
     vec![
-        ToolSpec {
-            name: "remember".into(),
-            description: "Store a memory for later recall.".into(),
-            parameters: obj(
-                json!({
-                    "kind": { "type": "string", "enum": ["event", "fact", "reflection"] },
-                    "content": { "type": "string" }
-                }),
-                &["content"],
-            ),
-        },
-        ToolSpec {
-            name: "recall".into(),
-            description: "Search your own memories by keywords.".into(),
-            parameters: obj(
-                json!({
-                    "query": { "type": "string" },
-                    "limit": { "type": "integer" }
-                }),
-                &["query"],
-            ),
-        },
-        ToolSpec {
-            name: "todo_add".into(),
-            description: "Add a task to your own to-do queue.".into(),
-            parameters: obj(
-                json!({
-                    "title": { "type": "string" },
-                    "body": { "type": "string" }
-                }),
-                &["title"],
-            ),
-        },
-        ToolSpec {
-            name: "todo_finish".into(),
-            description: "Close one of your queued tasks.".into(),
-            parameters: obj(
-                json!({
-                    "task_id": { "type": "string" },
-                    "ok": { "type": "boolean" }
-                }),
-                &["task_id"],
-            ),
-        },
-        ToolSpec {
-            name: "talk_to".into(),
-            description: "Speak with another agent by name — greet them, ask what they \
-                          have or what they want, negotiate, say anything. Your words \
-                          land in their inbox and wake them; they reply with their own \
-                          talk_to. This is how the world runs: conversation."
-                .into(),
-            parameters: obj(
-                json!({
-                    "who": { "type": "string", "description": "agent name (see who_is_here)" },
-                    "what": { "type": "string", "description": "what you say" }
-                }),
-                &["who", "what"],
-            ),
-        },
-        ToolSpec {
-            name: "subscribe".into(),
-            description: "Follow a board key: every future change to it is delivered \
-                          to your inbox and wakes you (including changes you cause \
-                          yourself). Subscribe only to things you must follow up on — \
-                          casual reads don't need a subscription."
-                .into(),
-            parameters: obj(
-                json!({ "key": { "type": "string", "description": "board key, e.g. item:watch" } }),
-                &["key"],
-            ),
-        },
-        ToolSpec {
-            name: "unsubscribe".into(),
-            description: "Stop following a board key — no more notifications from it."
-                .into(),
-            parameters: obj(
-                json!({ "key": { "type": "string" } }),
-                &["key"],
-            ),
-        },
-        ToolSpec {
-            name: "leave_thread".into(),
-            description: "Leave the negotiation you're in: your task closes and \
-                          the other side is notified in the thread. Use it when \
-                          the deal is off for you (price out of reach, time up)."
-                .into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "close_thread".into(),
-            description: "End the conversation you're in — 'we're done here'. \
-                          Settles the task for both sides and tells them. Use it \
-                          when the matter is truly finished (deal closed, chat over)."
-                .into(),
-            parameters: json!({ "type": "object", "properties": {} }),
-        },
-        ToolSpec {
-            name: "sleep".into(),
-            description: "After this think, sleep for the given duration \
-                          instead of the default interval.".into(),
-            parameters: obj(
-                json!({ "seconds": { "type": "number" } }),
-                &["seconds"],
-            ),
-        },
+        Arc::new(Remember),
+        Arc::new(Recall),
+        Arc::new(TodoAdd),
+        Arc::new(TodoFinish),
+        Arc::new(TalkTo),
+        Arc::new(Subscribe),
+        Arc::new(Unsubscribe),
+        Arc::new(LeaveThread),
+        Arc::new(CloseThread),
+        Arc::new(BoardRead),
+        Arc::new(Sleep),
     ]
 }
 
-/// Run one tool call from the model. Scene/domain tools are tried first,
-/// then the personal toolset.
-#[tracing::instrument(name = "tool.call", skip_all, fields(tool = %call.name, agent = %tools.agent_id()))]
-pub async fn dispatch_tool(
-    call: &ToolCall,
-    tools: &AgentTools,
-    domain_tools: &[Arc<dyn DomainTool>],
-) -> String {
-    for dt in domain_tools {
-        if dt.spec().name == call.name {
-            let ctx = DomainCtx {
-                store: tools.store(),
-                env: tools.env(),
-                actor: tools.agent_id(),
-            };
-            return match dt.call(&call.arguments, &ctx).await {
-                Ok(v) => v.to_string(),
-                Err(e) => json!({ "error": e }).to_string(),
-            };
-        }
-    }
+fn obj(props: Value, required: &[&str]) -> Value {
+    json!({ "type": "object", "properties": props, "required": required })
+}
 
-    let args = call.arguments.clone();
-    let out: Result<Value, String> = match call.name.as_str() {
-        "remember" => {
-            let content = arg_str(&args, "content");
-            let kind = match args.get("kind").and_then(Value::as_str) {
-                Some("event") => MemoryKind::Event,
-                Some("reflection") => MemoryKind::Reflection,
-                _ => MemoryKind::Fact,
-            };
-            match content {
-                Some(c) => {
-                    tools.remember(kind, &c).await;
-                    Ok(json!({ "ok": true }))
-                }
-                None => Err("missing 'content'".into()),
+/// Error suffix for a display line (errors may be long; actions stay short).
+fn err_suffix(v: &Value) -> String {
+    v.get("error")
+        .and_then(Value::as_str)
+        .map(|e| format!(" (failed: {e})"))
+        .unwrap_or_default()
+}
+
+macro_rules! impl_tool {
+    ($name:ident, $tool_name:literal, $desc:expr, $params:expr, describe($v:ident) $describe:block, call($args:ident, $tools:ident) $call:block, terminal($term:expr)) => {
+        struct $name;
+        #[async_trait]
+        #[allow(unused_variables)]
+        impl Tool for $name {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec { name: $tool_name.into(), description: $desc.into(), parameters: $params }
+            }
+            async fn call(&self, args: &Value, ctx: &AgentTools) -> Result<Value, String> {
+                let $args = args;
+                let $tools = ctx;
+                $call
+            }
+            #[allow(unused_braces)]
+            fn describe(&self, $v: &Value) -> String {
+                $describe
+            }
+            fn is_terminal(&self) -> bool {
+                $term
             }
         }
-        "recall" => {
-            let query = arg_str(&args, "query").unwrap_or_default();
-            let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(5);
-            let rows = tools.recall(&query, limit).await;
-            Ok(json!(rows.iter().map(|r| r.content.clone()).collect::<Vec<_>>()))
-        }
-        "todo_add" => {
-            let title = arg_str(&args, "title").unwrap_or_else(|| "(untitled)".into());
-            let body = arg_str(&args, "body").unwrap_or_default();
-            match tools.todo_add(&title, &body).await {
-                Some(t) => Ok(json!({ "task_id": t.id })),
-                None => Err("could not enqueue task".into()),
+    };
+}
+
+impl_tool!(Remember, "remember",
+    "Store a memory for later recall.",
+    obj(json!({
+        "kind": { "type": "string", "enum": ["event", "fact", "reflection"] },
+        "content": { "type": "string" }
+    }), &["content"]),
+    describe(v) { format!("remembered something{}", err_suffix(v)) },
+    call(args, tools) {
+        let kind = match args.get("kind").and_then(Value::as_str) {
+            Some("event") => MemoryKind::Event,
+            Some("reflection") => MemoryKind::Reflection,
+            _ => MemoryKind::Fact,
+        };
+        match arg_str(args, "content") {
+            Some(c) => {
+                tools.remember(kind, &c).await;
+                Ok(json!({ "ok": true }))
             }
+            None => Err("missing 'content'".into()),
         }
-        "todo_finish" => match arg_str(&args, "task_id") {
+    },
+    terminal(false));
+
+impl_tool!(Recall, "recall",
+    "Search your own memories by keywords.",
+    obj(json!({
+        "query": { "type": "string" },
+        "limit": { "type": "integer" }
+    }), &["query"]),
+    describe(v) { format!("checked their memory{}", err_suffix(v)) },
+    call(args, tools) {
+        let query = arg_str(args, "query").unwrap_or_default();
+        let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(5);
+        let rows = tools.recall(&query, limit).await;
+        Ok(json!(rows.iter().map(|r| r.content.clone()).collect::<Vec<_>>()))
+    },
+    terminal(false));
+
+impl_tool!(TodoAdd, "todo_add",
+    "Add a task to your own to-do queue.",
+    obj(json!({
+        "title": { "type": "string" },
+        "body": { "type": "string" }
+    }), &["title"]),
+    describe(v) { format!("added a task{}", err_suffix(v)) },
+    call(args, tools) {
+        let title = arg_str(args, "title").unwrap_or_else(|| "(untitled)".into());
+        let body = arg_str(args, "body").unwrap_or_default();
+        match tools.todo_add(&title, &body).await {
+            Some(t) => Ok(json!({ "task_id": t.id })),
+            None => Err("could not enqueue task".into()),
+        }
+    },
+    terminal(false));
+
+impl_tool!(TodoFinish, "todo_finish",
+    "Close one of your queued tasks.",
+    obj(json!({
+        "task_id": { "type": "string" },
+        "ok": { "type": "boolean" }
+    }), &["task_id"]),
+    describe(v) { format!("completed a task{}", err_suffix(v)) },
+    call(args, tools) {
+        match arg_str(args, "task_id") {
             Some(id) => {
                 let ok = args.get("ok").and_then(Value::as_bool).unwrap_or(true);
                 tools.todo_finish(&id, ok).await;
@@ -295,73 +243,161 @@ pub async fn dispatch_tool(
             }
             None => Err("missing 'task_id'".to_string()),
         }
-        "talk_to" => match (arg_str(&args, "who"), arg_str(&args, "what")) {
+    },
+    terminal(false));
+
+impl_tool!(TalkTo, "talk_to",
+    "Speak with another agent by name — greet them, ask what they have or \
+     what they want, negotiate, say anything. Your words land in their \
+     inbox and wake them; they reply with their own talk_to. This is how \
+     the world runs: conversation.",
+    obj(json!({
+        "who": { "type": "string", "description": "agent name (roster is in your context)" },
+        "what": { "type": "string", "description": "what you say" }
+    }), &["who", "what"]),
+    describe(v) {
+        format!(
+            "spoke with {}{}",
+            v.get("to").and_then(Value::as_str).unwrap_or("someone"),
+            err_suffix(v)
+        )
+    },
+    call(args, tools) {
+        match (arg_str(args, "who"), arg_str(args, "what")) {
             (Some(who), Some(what)) => match tools.talk_to(&who, &what).await {
                 Ok(()) => Ok(json!({ "ok": true, "to": who })),
                 Err(e) => Err(e),
             },
             (None, _) => Err("missing 'who'".into()),
             (_, None) => Err("missing 'what'".into()),
-        },
-        "unsubscribe" => match arg_str(&args, "key") {
+        }
+    },
+    terminal(false));
+
+impl_tool!(Subscribe, "subscribe",
+    "Follow a board key: every future change to it is delivered to your \
+     inbox and wakes you (including changes you cause yourself). Subscribe \
+     only to things you must follow up on.",
+    obj(json!({ "key": { "type": "string" } }), &["key"]),
+    describe(v) { format!("followed a key{}", err_suffix(v)) },
+    call(args, tools) {
+        match arg_str(args, "key") {
             Some(key) => {
-                tools.unsubscribe(&key).await;
-                Ok(json!({ "ok": true, "following": null }))
+                tools.subscribe(&key).await;
+                Ok(json!({ "ok": true, "key": key }))
             }
             None => Err("missing 'key'".into()),
-        },
-        "leave_thread" => match tools.leave_thread().await {
-            Ok(()) => Ok(json!({ "ok": true })),
-            Err(e) => Err(e),
-        },
-        "sleep" => {
-            let secs = args.get("seconds").and_then(Value::as_f64).unwrap_or(0.0);
-            if !(secs.is_finite()) || secs < 0.0 || secs > 86_400.0 {
-                Err("sleep seconds out of range (0..=86400)".into())
-            } else {
-                tools.request_sleep_ms((secs * 1000.0) as u64);
-                Ok(json!({ "ok": true, "sleep_seconds": secs }))
+        }
+    },
+    terminal(false));
+
+impl_tool!(Unsubscribe, "unsubscribe",
+    "Stop following a board key — no more notifications from it.",
+    obj(json!({ "key": { "type": "string" } }), &["key"]),
+    describe(v) { format!("unfollowed a key{}", err_suffix(v)) },
+    call(args, tools) {
+        match arg_str(args, "key") {
+            Some(key) => {
+                tools.unsubscribe(&key).await;
+                Ok(json!({ "ok": true }))
+            }
+            None => Err("missing 'key'".into()),
+        }
+    },
+    terminal(false));
+
+impl_tool!(LeaveThread, "leave_thread",
+    "End YOUR part in the conversation you're in: your task closes and the \
+     other side is told in the thread. Use it when the matter is off for you.",
+    json!({ "type": "object", "properties": {} }),
+    describe(v) { format!("left the conversation{}", err_suffix(v)) },
+    call(args, tools) {
+        tools.leave_thread().await?;
+        Ok(json!({ "ok": true }))
+    },
+    terminal(false));
+
+impl_tool!(CloseThread, "close_thread",
+    "End the conversation you're in — 'we're done here'. Settles the task \
+     for both sides and tells them. Use it when the matter is truly finished.",
+    json!({ "type": "object", "properties": {} }),
+    describe(v) { format!("closed the thread{}", err_suffix(v)) },
+    call(args, tools) {
+        tools.close_thread().await?;
+        Ok(json!({ "ok": true }))
+    },
+    terminal(false));
+
+impl_tool!(BoardRead, "board_read",
+    "Read the shared audit board. Omit 'key' to read the whole board.",
+    obj(json!({ "key": { "type": "string" } }), &[]),
+    describe(v) { format!("read the board{}", err_suffix(v)) },
+    call(args, tools) {
+        match arg_str(args, "key") {
+            Some(key) => {
+                let v = tools.board_get(&key).await;
+                Ok(json!({ "key": key, "value": v }))
+            }
+            None => {
+                let snap = tools.board_snapshot().await;
+                Ok(json!(snap.into_iter().collect::<std::collections::BTreeMap<_, _>>()))
             }
         }
-        other => Err(format!("unknown tool '{other}'")),
-    };
-    let out = match out {
-        Ok(v) => v.to_string(),
-        Err(e) => json!({ "error": e }).to_string(),
-    };
-    out
+    },
+    terminal(false));
+
+struct Sleep;
+#[async_trait]
+impl Tool for Sleep {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "sleep".into(),
+            description: "After this think, sleep for the given duration instead \
+                          of the default interval."
+                .into(),
+            parameters: obj(json!({ "seconds": { "type": "number" } }), &["seconds"]),
+        }
+    }
+    async fn call(&self, args: &Value, ctx: &AgentTools) -> Result<Value, String> {
+        let secs = args.get("seconds").and_then(Value::as_f64).unwrap_or(0.0);
+        if !secs.is_finite() || secs < 0.0 || secs > 86_400.0 {
+            Err("sleep seconds out of range (0..=86400)".into())
+        } else {
+            ctx.request_sleep_ms((secs * 1000.0) as u64);
+            Ok(json!({ "ok": true, "sleep_seconds": secs }))
+        }
+    }
+    fn describe(&self, v: &Value) -> String {
+        format!("went to sleep{}", err_suffix(v))
+    }
+    fn is_terminal(&self) -> bool {
+        true
+    }
 }
 
-/// Verb phrase for the common tools; falls back to "used <tool>".
-fn friendly_line(call: &ToolCall, out: &str) -> String {
-    let v: Value = serde_json::from_str(out).unwrap_or_default();
-    let err = v.get("error").and_then(Value::as_str).map(|e| format!(" (failed: {e})"))
-        .unwrap_or_default();
-    match call.name.as_str() {
-        "send_offer" => format!("offered ${:.0}{err}",
-            v.get("offered").and_then(Value::as_f64).unwrap_or(0.0)),
-        "accept_deal" => format!("closed the deal at ${:.0}{err}",
-            v.get("deal_price").and_then(Value::as_f64).unwrap_or(0.0)),
-        "remember" => format!("remembered something{err}"),
-        "recall" => format!("checked their memory{err}"),
-        "todo_add" => format!("added a task to their list{err}"),
-        "todo_finish" => format!("ticked off a task{err}"),
-        "board_read" => format!("looked at the board{err}"),
-        "talk_to" => format!(
-            "spoke with {}{err}",
-            v.get("to").and_then(Value::as_str).unwrap_or("someone")
-        ),
-        "subscribe" => format!(
-            "started following {}{err}",
-            v.get("following").and_then(Value::as_str).unwrap_or("a key")
-        ),
-        "unsubscribe" => format!("stopped following {}{err}",
-            v.get("following").and_then(Value::as_str).unwrap_or("a key")),
-        "leave_thread" => format!("left the negotiation{err}"),
-        "close_thread" => format!("closed the conversation{err}"),
-        "sleep" => format!("went to sleep{err}"),
-        other => format!("used {other}{err}"),
-    }
+/// Run one tool call from the model against the standard registry.
+#[tracing::instrument(name = "tool.call", skip_all, fields(tool = %call.name, agent = %tools.agent_id()))]
+pub async fn dispatch_tool(
+    call: &ToolCall,
+    tools: &AgentTools,
+    all_tools: &[Arc<dyn Tool>],
+) -> String {
+    let tool = all_tools.iter().find(|t| t.spec().name == call.name);
+    let out = match tool {
+        Some(t) => match t.call(&call.arguments, tools).await {
+            Ok(v) => v.to_string(),
+            Err(e) => json!({ "error": e }).to_string(),
+        },
+        None => json!({ "error": format!("unknown tool '{}'", call.name) }).to_string(),
+    };
+    // The tool's own ≤3-word line — base never names scene tools.
+    let v: Value = serde_json::from_str(&out).unwrap_or_default();
+    let said = match tool {
+        Some(t) => t.describe(&v),
+        None => format!("used {}", call.name),
+    };
+    tracing::info!(agent = %tools.agent_name(), t = %tools.think_tag(), "{said}");
+    out
 }
 
 fn arg_str(args: &Value, key: &str) -> Option<String> {
@@ -435,11 +471,20 @@ impl Brain for LlmBrain {
             .iter()
             .map(|a| format!("- {} {}: {}", a.kind, a.name, a.qty))
             .collect();
+        let thread_state = match &ctx.thread {
+            Some(t) => format!(
+                "the conversation is {} — next to speak: {}",
+                t.status,
+                t.turn.as_deref().unwrap_or("nobody yet")
+            ),
+            None => "no conversation".into(),
+        };
         let user = format!(
-            "TASK: {title}\n{body}\n\nWHAT YOU OWN:\n{assets}\n\nCONVERSATION SO FAR:\n{thread}\n\nYOUR TO-DO:\n{todo}\n\nPEOPLE IN THIS WORLD (name — role, already known; do NOT re-check):\n{roster}\n\nENVIRONMENT BOARD:\n{board}",
+            "TASK: {title}\n{body}\n\nCONVERSATION STATUS: {thread_state}\n\nWHAT YOU OWN:\n{assets}\n\nCONVERSATION SO FAR:\n{thread}\n\nYOUR TO-DO:\n{todo}\n\nPEOPLE IN THIS WORLD (name — role, already known; do NOT re-check):\n{roster}\n\nENVIRONMENT BOARD:\n{board}",
             title = ctx.task_title,
             body = ctx.task_body,
             assets = if asset_lines.is_empty() { "(nothing)".into() } else { asset_lines.join("\n") },
+            thread_state = thread_state,
             thread = if thread_lines.is_empty() { "(nothing yet — you start)".into() } else { thread_lines.join("\n") },
             todo = if todo_lines.is_empty() { "(empty)".into() } else { todo_lines.join("\n") },
             roster = roster_lines.join("\n"),
@@ -455,7 +500,7 @@ impl Brain for LlmBrain {
             .await
             .ok()
             .map(|ts| ts.iter().map(|t| t.id.clone()).collect());
-        let domain: Vec<Arc<dyn DomainTool>> = match &granted {
+        let granted_domain: Vec<Arc<dyn Tool>> = match &granted {
             Some(g) => self
                 .domain_tools
                 .iter()
@@ -464,6 +509,8 @@ impl Brain for LlmBrain {
                 .collect(),
             None => self.domain_tools.clone(),
         };
+        let mut all = base_tools();
+        all.extend(granted_domain);
 
         let mut req = CompletionRequest {
             model: agent.as_ref().map(|a| a.model.clone()).unwrap_or_else(|| "mock".into()),
@@ -475,11 +522,7 @@ impl Brain for LlmBrain {
                 .as_ref()
                 .map(|a| Some(a.reasoning_effort.clone()))
                 .unwrap_or_else(|| Some("medium".into())),
-            tools: {
-                let mut specs = tool_specs();
-                specs.extend(domain.iter().map(|t| t.spec()));
-                specs
-            },
+            tools: all.iter().map(|t| t.spec()).collect(),
             // Same think id as the agent.think span: one trace tree.
             run_id: Some(ctx.run_id.clone()),
             api_key: None,
@@ -501,7 +544,7 @@ impl Brain for LlmBrain {
             req.model = a.model.clone();
         }
 
-        let text = self.complete_with_tools(provider, req, tools, &domain).await?;
+        let text = self.complete_with_tools(provider, req, tools, &all).await?;
 
         Ok(ThinkOutcome {
             ok: true,
