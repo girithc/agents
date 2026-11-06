@@ -32,6 +32,8 @@ pub struct ThinkCtx {
     pub thread: Option<ThreadView>,
     /// What I own (money, items) — mine only, never others'.
     pub assets: Vec<agenthub_storage::store::agent::Asset>,
+    /// What I know (keyed facts, always current) — pushed, never re-polled.
+    pub facts: Vec<(String, String)>,
     /// Title/body of the popped task, or the incoming message that woke it.
     pub task_title: String,
     pub task_body: String,
@@ -447,6 +449,17 @@ impl AgentTools {
             .into_iter()
             .map(|a| (a.name, a.role))
             .collect()
+    }
+
+    /// Set a fact — create or overwrite. This is how state changes: an
+    /// update to a key, never a new diary line.
+    pub async fn fact_put(&self, key: &str, value: &str) {
+        let _ = self.store.fact_put(&self.agent_id, key, value).await;
+    }
+
+    /// Drop a fact — it's no longer true or no longer mine to track.
+    pub async fn fact_forget(&self, key: &str) {
+        let _ = self.store.fact_forget(&self.agent_id, key).await;
     }
 }
 

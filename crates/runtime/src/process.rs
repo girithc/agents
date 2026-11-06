@@ -170,7 +170,7 @@ async fn run(
                         );
                         let ctx = think_ctx(&store, &env, &agent_id, &think_id, None, "message", &body).await;
                         tools.set_current_thread(None, 0);
-                        let outcome = run_think(&store, brain.as_ref(), &tools, &ctx, None, true)
+                        let outcome = run_think(&store, brain.as_ref(), &tools, &ctx, None, false)
                             .instrument(span)
                             .await;
                         // The mail path uses the outcome's sleep request below.
@@ -293,7 +293,7 @@ async fn run_task(
         let ctx = think_ctx(store, env, tools.agent_id(), &run_id, Some(&task), &task.title, &task.body).await;
         let count = ctx.thread.as_ref().map(|t| t.messages.len()).unwrap_or(0);
         tools.set_current_thread(task.thread_id.as_deref(), count);
-        let out = run_think(store, brain, tools, &ctx, Some(&task.id), true).await;
+        let out = run_think(store, brain, tools, &ctx, Some(&task.id), false).await;
         tracing::info!(agent = %tools.agent_name(), t = %tag, "finished");
         out
     }
@@ -504,12 +504,20 @@ async fn think_ctx(
         None => None,
     };
     let assets = store.assets_of(agent_id).await.unwrap_or_default();
+    let facts: Vec<(String, String)> = store
+        .facts_of(agent_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| (f.key, f.value))
+        .collect();
     ThinkCtx {
         agent_id: agent_id.to_string(),
         run_id: run_id.to_string(),
         roster,
         thread,
         assets,
+        facts,
         task_title: task_title.to_string(),
         task_body: task_body.to_string(),
         soul,

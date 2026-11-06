@@ -210,6 +210,55 @@ impl_tool!(Recall, "recall",
     },
     terminal(false));
 
+impl_tool!(FactPut, "fact_put",
+    "Set a fact you know — create or overwrite. This is how state changes: \
+     'watch_offer = $70' becomes 'watch_offer = $75' by writing again, never \
+     by piling up notes. Your facts are always in your context.",
+    obj(json!({
+        "key": { "type": "string", "description": "short name, e.g. watch_offer" },
+        "value": { "type": "string", "description": "the current truth" }
+    }), &["key", "value"]),
+    describe(v) {
+        format!(
+            "wrote down {} = {}{}",
+            v.get("key").and_then(Value::as_str).unwrap_or("a fact"),
+            v.get("value").and_then(Value::as_str).unwrap_or(""),
+            err_suffix(v)
+        )
+    },
+    call(args, tools) {
+        match (arg_str(args, "key"), arg_str(args, "value")) {
+            (Some(key), Some(value)) => {
+                tools.fact_put(&key, &value).await;
+                Ok(json!({ "ok": true, "key": key, "value": value }))
+            }
+            (None, _) => Err("missing 'key'".into()),
+            (_, None) => Err("missing 'value'".into()),
+        }
+    },
+    terminal(false));
+
+impl_tool!(FactForget, "fact_forget",
+    "Drop a fact that is no longer true or no longer yours to track.",
+    obj(json!({ "key": { "type": "string" } }), &["key"]),
+    describe(v) {
+        format!(
+            "forgot {}{}",
+            v.get("key").and_then(Value::as_str).unwrap_or("a fact"),
+            err_suffix(v)
+        )
+    },
+    call(args, tools) {
+        match arg_str(args, "key") {
+            Some(key) => {
+                tools.fact_forget(&key).await;
+                Ok(json!({ "ok": true, "key": key }))
+            }
+            None => Err("missing 'key'".into()),
+        }
+    },
+    terminal(false));
+
 impl_tool!(TodoAdd, "todo_add",
     "Add a task to your own to-do queue.",
     obj(json!({
@@ -441,6 +490,15 @@ impl Brain for LlmBrain {
             system.push_str("HOUSE RULES:\n");
             for r in &ctx.rules {
                 system.push_str(&format!("- {r}\n"));
+            }
+        }
+        // Semantic memory: my facts, always current, always here — never
+        // re-polled. Update them with fact_put when the world moves; drop
+        // them with fact_forget when they stop being true.
+        if !ctx.facts.is_empty() {
+            system.push_str("\nMY FACTS (keyed, always current — keep them so):\n");
+            for (k, v) in &ctx.facts {
+                system.push_str(&format!("- {k} = {v}\n"));
             }
         }
         system.push_str(

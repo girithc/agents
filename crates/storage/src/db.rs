@@ -148,6 +148,17 @@ CREATE TABLE IF NOT EXISTS agent_memory (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_memory_agent ON agent_memory(agent_id);
 
+-- Semantic memory: keyed facts the agent keeps CURRENT (upsert, never
+-- append) — "my offer: $75", "the seller's floor: $70". Always pushed
+-- into the agent's think prompt; the agent edits them with fact tools.
+CREATE TABLE IF NOT EXISTS agent_facts (
+    agent_id   TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, key)
+);
+
 CREATE TABLE IF NOT EXISTS tools (
     id         TEXT PRIMARY KEY,
     kind       TEXT NOT NULL DEFAULT 'builtin',
