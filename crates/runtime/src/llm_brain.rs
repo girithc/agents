@@ -488,6 +488,12 @@ impl Brain for LlmBrain {
 
         // System: who I am, what I want, what the house demands.
         let mut system = String::new();
+        system.push_str(&format!(
+            "WHO YOU ARE: your name is '{name}' (role: {role}). You speak ONLY \
+             as '{name}' — never as, or on behalf of, anyone else in the roster.\n\n",
+            name = ctx.self_name,
+            role = ctx.self_role,
+        ));
         if !ctx.soul.is_empty() {
             system.push_str("SOUL:\n");
             system.push_str(&ctx.soul);
@@ -551,8 +557,19 @@ impl Brain for LlmBrain {
             .thread
             .as_ref()
             .map(|t| {
-                let mut lines: Vec<String> =
-                    t.messages.iter().map(|(who, said)| format!("{who} said: {said}")).collect();
+                let mut lines: Vec<String> = t
+                    .messages
+                    .iter()
+                    .map(|(who, said)| {
+                        // Mark my own words — the model must always know
+                        // which side of the transcript is itself.
+                        if *who == ctx.self_name {
+                            format!("{who} (you) said: {said}")
+                        } else {
+                            format!("{who} said: {said}")
+                        }
+                    })
+                    .collect();
                 // This conversation's fact sheet — its working state.
                 if !t.facts.is_empty() {
                     lines.push(String::new());

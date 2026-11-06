@@ -446,6 +446,12 @@ async fn think_ctx(
     task_title: &str,
     task_body: &str,
 ) -> ThinkCtx {
+    // Who THIS agent is (name + role) — pinned so the model never speaks
+    // as the counterpart.
+    let (self_name, self_role) = match store.get_agent(agent_id).await.ok().flatten() {
+        Some(a) => (a.name, a.role),
+        None => (agent_id.to_string(), String::new()),
+    };
     let (soul, goal) = match store.get_soul(agent_id).await.ok().flatten() {
         Some(s) => (s.soul, s.goal),
         None => (String::new(), String::new()),
@@ -526,6 +532,8 @@ async fn think_ctx(
         .collect();
     ThinkCtx {
         agent_id: agent_id.to_string(),
+        self_name,
+        self_role,
         run_id: run_id.to_string(),
         roster,
         thread,

@@ -24,6 +24,10 @@ pub struct ThreadView {
 
 pub struct ThinkCtx {
     pub agent_id: String,
+    /// Who THIS agent is — pinned into every prompt so the model never
+    /// speaks as the counterpart (role confusion at low effort).
+    pub self_name: String,
+    pub self_role: String,
     /// This think's trace id — spans and provider calls share it.
     pub run_id: String,
     /// Who exists in this world (name, role) — pushed, so the agent
