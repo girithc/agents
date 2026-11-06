@@ -143,6 +143,21 @@ async fn main() {
 
     let started = std::time::Instant::now();
     let env_id = world.env.environment_id().to_string();
+
+    // Draw on the ALTERNATE SCREEN (like htop): redrawing never scrolls
+    // the user's real terminal or floods its scrollback. Ctrl+C exits
+    // cleanly too.
+    print!("\x1b[?1049h\x1b[2J");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            print!("\x1b[?1049l");
+            let _ = std::io::stdout().flush();
+            std::process::exit(0);
+        }
+    });
+
     let mut last_msg_id = 0i64;
     let mut last_change_id = 0i64;
     let mut feed: Vec<String> = Vec::new();
@@ -259,6 +274,9 @@ async fn main() {
         }
 
         // ---- render
+        // Home cursor, overwrite the frame, clear whatever hangs below
+        // it — the frame never overflows the bottom row, so the terminal
+        // never scrolls and no copies pile up.
         let height = 24usize;
         let mut left: Vec<String> = Vec::new();
         for line in &feed {
@@ -268,7 +286,7 @@ async fn main() {
         }
         let left_show: Vec<String> = left[left.len().saturating_sub(height - 4)..].to_vec();
 
-        let mut out = String::from("\x1b[2J\x1b[H");
+        let mut out = String::from("\x1b[H\x1b[J");
         out.push_str("TRADER MARKET");
         out.push_str(&" ".repeat(W_LEFT - 13));
         out.push_str("│  BOARD\n");
@@ -311,11 +329,13 @@ async fn main() {
             out.push_str(&pad(&clip(&l, W_LEFT - 1), W_LEFT));
             out.push_str("│ ");
             out.push_str(&clip(&r, W_RIGHT - 2));
-            out.push('\n');
+            if i + 1 < rows {
+                out.push('\n');
+            }
         }
+        out.push_str("\x1b[J"); // clear anything below the frame — no scroll
 
         print!("{out}");
-        use std::io::Write;
         let _ = std::io::stdout().flush();
 
         if deal_price.is_some() {
@@ -334,5 +354,9 @@ async fn main() {
         }
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
+    // Leave the alternate screen BEFORE printing the closing line — it
+    // lands in the user's real terminal, not the discarded buffer.
+    print!("\x1b[?1049l");
+    let _ = std::io::stdout().flush();
     println!("\n(done — world rows are in {})", dir.display());
 }
