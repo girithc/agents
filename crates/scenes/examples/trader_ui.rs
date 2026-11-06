@@ -160,7 +160,7 @@ async fn main() {
 
     let mut last_msg_id = 0i64;
     let mut last_change_id = 0i64;
-    let mut feed: Vec<String> = Vec::new();
+    let mut feed: Vec<(String, String)> = Vec::new(); // (speaker, line)
     let mut deal_price: Option<f64> = None;
 
     loop {
@@ -186,7 +186,7 @@ async fn main() {
                     .flatten()
                     .map(|a| a.name)
                     .unwrap_or_else(|| m.recipient.clone());
-                feed.push(format!("{from} → {to}: {}", m.body));
+                feed.push((from.clone(), format!("→ {to}: {}", m.body)));
             }
         }
         for r in s
@@ -205,11 +205,11 @@ async fn main() {
                 "offer_made" => {
                     let from = p.get("from").and_then(|v| v.as_str()).unwrap_or("");
                     let who = names.get(from).cloned().unwrap_or_else(|| from.to_string());
-                    feed.push(format!("{who} offered ${:.0}", p.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0)));
+                    feed.push((who.clone(), format!("offered ${:.0}", p.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0))));
                 }
                 "deal" => {
                     deal_price = p.get("price").and_then(|v| v.as_f64());
-                    feed.push(format!("🤝 deal closed at ${:.0}", deal_price.unwrap_or(0.0)));
+                    feed.push(("market".into(), format!("🤝 deal closed at ${:.0}", deal_price.unwrap_or(0.0))));
                 }
                 _ => {}
             }
@@ -251,6 +251,9 @@ async fn main() {
                 if who != party {
                     continue;
                 }
+                if said.to_lowercase().contains("budget") {
+                    continue; // "my budget is $100" is not a bid
+                }
                 if let Some(p) = last_dollar(said) {
                     return Some(p);
                 }
@@ -270,7 +273,7 @@ async fn main() {
                 Some("stopped") => "stopped",
                 _ => "…",
             };
-            states.push(format!("{name}: {status}"));
+            states.push((name.clone(), status.to_string()));
         }
 
         // ---- render
@@ -279,12 +282,29 @@ async fn main() {
         // never scrolls and no copies pile up.
         let height = 24usize;
         let mut left: Vec<String> = Vec::new();
-        for line in &feed {
-            for l in wrap(line, W_LEFT - 1) {
-                left.push(l);
+        let mut prev_speaker: Option<&String> = None;
+        for (who, line) in &feed {
+            if prev_speaker != Some(who) {
+                left.push(String::new()); // space between each side
+                prev_speaker = Some(who);
+            }
+            let wrapped = wrap(line, W_LEFT - 3);
+            for (i, l) in wrapped.into_iter().enumerate() {
+                left.push(if i == 0 { l } else { format!("  {l}") });
             }
         }
-        let left_show: Vec<String> = left[left.len().saturating_sub(height - 4)..].to_vec();
+        // Live activity: whoever is mid-think shows as dim text pinned to
+        // the bottom of the feed — the words land when the think lands,
+        // but the work is visible now.
+        let thinkers: Vec<String> = states
+            .iter()
+            .filter(|(_, st)| st == "thinking")
+            .map(|(n, _)| format!("  \x1b[2m· {n} is thinking…\x1b[0m"))
+            .collect();
+        let room = height - 4 - thinkers.len();
+        let mut left_show: Vec<String> =
+            left[left.len().saturating_sub(room)..].to_vec();
+        left_show.extend(thinkers);
 
         let mut out = String::from("\x1b[H\x1b[J");
         out.push_str("TRADER MARKET");
@@ -296,14 +316,21 @@ async fn main() {
         out.push('\n');
 
         let mut right: Vec<String> = Vec::new();
-        right.push("watch".to_string());
-        right.push(format!("  status: {}", {
-            board
-                .iter()
-                .find(|(k, _)| k == "item:watch")
-                .and_then(|(_, v)| v.get("status").and_then(|s| s.as_str()))
-                .unwrap_or("available")
-        }));
+        right.push("MARKET".to_string());
+        let item_rows: Vec<(String, String)> = board
+            .iter()
+            .filter_map(|(k, v)| {
+                let id = k.strip_prefix("item:")?;
+                let status = v.get("status").and_then(|s| s.as_str())?.to_string();
+                Some((id.to_string(), status))
+            })
+            .collect();
+        if item_rows.is_empty() {
+            right.push("  (nothing listed yet)".into());
+        }
+        for (id, status) in &item_rows {
+            right.push(format!("  item:{} — {}", &id[..8.min(id.len())], status));
+        }
         right.push(format!(
             "  buyer bid: {}",
             buyer_bid.map(|p| format!("${p:.0}")).unwrap_or_else(|| "—".into())
@@ -318,8 +345,8 @@ async fn main() {
         ));
         right.push(String::new());
         right.push("AGENTS".to_string());
-        for st in &states {
-            right.push(format!("  {st}"));
+        for (name, status) in &states {
+            right.push(format!("  {name}: {status}"));
         }
 
         let rows = height.saturating_sub(3);
