@@ -186,7 +186,7 @@ async fn main() {
                     .flatten()
                     .map(|a| a.name)
                     .unwrap_or_else(|| m.recipient.clone());
-                feed.push((from.clone(), format!("→ {to}: {}", m.body)));
+                feed.push((from.clone(), format!("{from} → {to}: {}", m.body)));
             }
         }
         for r in s

@@ -122,6 +122,121 @@ async fn wait_task_status(
     }
 }
 
+// ------------------------------------------------------ attribution checks
+// The buyer/seller role-swap hunt: is a message attributed to the agent
+// that spoke it, and does each think receive ITS OWN context?
+
+/// A provider that captures the assembled request, then answers plainly.
+struct CapturingProvider {
+    captured: Arc<std::sync::Mutex<Vec<CompletionRequest>>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for CapturingProvider {
+    fn id(&self) -> &'static str {
+        "capturing"
+    }
+
+    async fn complete(
+        &self,
+        req: CompletionRequest,
+    ) -> agenthub_providers::Result<CompletionResponse> {
+        self.captured.lock().unwrap().push(req);
+        Ok(CompletionResponse {
+            text: "ok".into(),
+            reasoning: None,
+            tool_calls: vec![],
+            usage: None,
+            raw: serde_json::json!({}),
+        })
+    }
+
+    async fn complete_stream(
+        &self,
+        _req: CompletionRequest,
+    ) -> agenthub_providers::Result<
+        futures::stream::BoxStream<
+            'static,
+            agenthub_providers::Result<agenthub_providers::StreamEvent>,
+        >,
+    > {
+        Err(ProviderError::Stream("capturing", "does not stream".into()))
+    }
+}
+
+#[tokio::test]
+async fn talk_to_attributes_sender_correctly() {
+    let s = store().await;
+    let env_row = s.create_environment("t", 1000).await.unwrap();
+    let env = EnvHandle::new(s.clone(), &env_row.id);
+    let buyer = agent_row(&s, "buyer", "mock").await;
+    let _seller = agent_row(&s, "seller", "mock").await;
+
+    // The BUYER speaks. The record must say so — forever.
+    let tools = crate::brain::AgentTools::new(s.clone(), env.clone(), buyer.clone()).await;
+    tools.talk_to("seller", "I am the buyer, hello").await.unwrap();
+
+    let msgs = s.messages_in_world(&env_row.id).await.unwrap();
+    assert_eq!(msgs.len(), 1);
+    let sender_name = s
+        .get_agent(&msgs[0].sender)
+        .await
+        .unwrap()
+        .unwrap()
+        .name;
+    assert_eq!(sender_name, "buyer", "the message must be attributed to the agent that spoke it");
+}
+
+#[tokio::test]
+async fn think_context_belongs_to_the_right_agent() {
+    let s = store().await;
+    let env_row = s.create_environment("t", 1000).await.unwrap();
+    let env = EnvHandle::new(s.clone(), &env_row.id);
+    let buyer = agent_row(&s, "buyer", "capturing").await;
+    let seller = agent_row(&s, "seller", "capturing").await;
+
+    // Distinct private state per agent.
+    s.fact_put(&buyer, "budget", "$100", "").await.unwrap();
+    s.fact_put(&seller, "floor", "$70", "").await.unwrap();
+    s.mint_item(&env_row.id, "item", "watch", Some(&seller)).await.unwrap();
+
+    // Distinct souls.
+    s.upsert_soul(&buyer, "You are a buyer.", "").await.unwrap();
+    s.upsert_soul(&seller, "You are a seller.", "").await.unwrap();
+
+    // Spawn the SELLER's loop with a capturing provider.
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry = Registry::new();
+    registry.register(Arc::new(CapturingProvider { captured: captured.clone() }));
+    let brain = Arc::new(LlmBrain::new(s.clone(), Arc::new(registry)));
+    let handle = spawn_agent_loop(
+        AgentDeps { store: s.clone(), env, agent_id: seller.clone() },
+        brain,
+    );
+
+    // Wait for the first idle think to fire.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while captured.lock().unwrap().is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    handle.stop();
+    handle.finished().await;
+
+    let reqs = captured.lock().unwrap();
+    assert!(!reqs.is_empty(), "the seller's loop must have thought");
+    let system = reqs[0].messages.iter().find(|m| m.role.as_str() == "system").unwrap().content.clone();
+    let user = reqs[0].messages.iter().find(|m| m.role.as_str() == "user").unwrap().content.clone();
+
+    // The context is the SELLER's — soul, facts, items — and NOTHING of
+    // the buyer's leaks in.
+    assert!(system.contains("You are a seller."), "the think must carry the seller's soul");
+    assert!(system.contains("floor = $70"), "the think must carry the seller's facts");
+    assert!(!system.contains("budget"), "the buyer's facts must not leak into the seller's think");
+    assert!(user.contains("watch"), "the think must carry the seller's items");
+    assert!(!user.contains("budget = "), "the buyer's facts must not leak into the seller's think");
+    let _ = buyer;
+}
+
 // ------------------------------------------------------------ loop mechanics
 // (no model calls: the queue stays empty or the brain errors offline)
 
