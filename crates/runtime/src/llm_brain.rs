@@ -123,6 +123,8 @@ pub fn base_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(Remember),
         Arc::new(Recall),
+        Arc::new(FactPut),
+        Arc::new(FactForget),
         Arc::new(TodoAdd),
         Arc::new(TodoFinish),
         Arc::new(TalkTo),
@@ -173,10 +175,12 @@ macro_rules! impl_tool {
 }
 
 impl_tool!(Remember, "remember",
-    "Store a memory for later recall.",
+    "Store a memory for later recall. Optionally anchor it to a record \
+     (e.g. about: 'item:12') so it sticks to that particular thing.",
     obj(json!({
         "kind": { "type": "string", "enum": ["event", "fact", "reflection"] },
-        "content": { "type": "string" }
+        "content": { "type": "string" },
+        "about": { "type": "string", "description": "optional record anchor, e.g. item:12" }
     }), &["content"]),
     describe(v) { format!("remembered something{}", err_suffix(v)) },
     call(args, tools) {
@@ -187,7 +191,7 @@ impl_tool!(Remember, "remember",
         };
         match arg_str(args, "content") {
             Some(c) => {
-                tools.remember(kind, &c).await;
+                tools.remember(kind, &c, arg_str(args, "about").as_deref()).await;
                 Ok(json!({ "ok": true }))
             }
             None => Err("missing 'content'".into()),
@@ -212,11 +216,14 @@ impl_tool!(Recall, "recall",
 
 impl_tool!(FactPut, "fact_put",
     "Set a fact you know — create or overwrite. This is how state changes: \
-     'watch_offer = $70' becomes 'watch_offer = $75' by writing again, never \
-     by piling up notes. Your facts are always in your context.",
+     'my_offer = $70' becomes 'my_offer = $75' by writing again, never by \
+     piling up notes. Facts are scoped automatically: inside a conversation \
+     they belong to that deal; pass about: 'item:12' to pin one to a \
+     particular thing instead. Always in your context.",
     obj(json!({
-        "key": { "type": "string", "description": "short name, e.g. watch_offer" },
-        "value": { "type": "string", "description": "the current truth" }
+        "key": { "type": "string", "description": "short name, e.g. my_offer" },
+        "value": { "type": "string", "description": "the current truth" },
+        "about": { "type": "string", "description": "optional anchor, e.g. item:12 — which particular thing this is about" }
     }), &["key", "value"]),
     describe(v) {
         format!(
@@ -229,8 +236,8 @@ impl_tool!(FactPut, "fact_put",
     call(args, tools) {
         match (arg_str(args, "key"), arg_str(args, "value")) {
             (Some(key), Some(value)) => {
-                tools.fact_put(&key, &value).await;
-                Ok(json!({ "ok": true, "key": key, "value": value }))
+                tools.fact_put(&key, &value, arg_str(args, "about").as_deref()).await;
+                Ok(json!({ "ok": true, "key": key, "value": value, "about": args.get("about").cloned().unwrap_or(json!("")) }))
             }
             (None, _) => Err("missing 'key'".into()),
             (_, None) => Err("missing 'value'".into()),
@@ -239,8 +246,13 @@ impl_tool!(FactPut, "fact_put",
     terminal(false));
 
 impl_tool!(FactForget, "fact_forget",
-    "Drop a fact that is no longer true or no longer yours to track.",
-    obj(json!({ "key": { "type": "string" } }), &["key"]),
+    "Drop a fact that is no longer true or no longer yours to track. \
+     Same scoping as fact_put: automatic per conversation, or pass \
+     about: 'item:12' to drop one pinned to a particular thing.",
+    obj(json!({
+        "key": { "type": "string" },
+        "about": { "type": "string", "description": "optional anchor, e.g. item:12" }
+    }), &["key"]),
     describe(v) {
         format!(
             "forgot {}{}",
@@ -251,7 +263,7 @@ impl_tool!(FactForget, "fact_forget",
     call(args, tools) {
         match arg_str(args, "key") {
             Some(key) => {
-                tools.fact_forget(&key).await;
+                tools.fact_forget(&key, arg_str(args, "about").as_deref()).await;
                 Ok(json!({ "ok": true, "key": key }))
             }
             None => Err("missing 'key'".into()),
@@ -500,6 +512,9 @@ impl Brain for LlmBrain {
             for (k, v) in &ctx.facts {
                 system.push_str(&format!("- {k} = {v}\n"));
             }
+            system.push_str("(write with fact_put: a fact about a particular thing \
+                takes about: 'item:<id>'; facts written inside a conversation \
+                attach to that deal automatically)\n");
         }
         system.push_str(
             "\nHOW TO WORK: use the tools you need (usually 1-3 calls), then ALWAYS \
@@ -535,13 +550,32 @@ impl Brain for LlmBrain {
         let thread_lines: Vec<String> = ctx
             .thread
             .as_ref()
-            .map(|t| t.messages.iter().map(|(who, said)| format!("{who} said: {said}")).collect())
+            .map(|t| {
+                let mut lines: Vec<String> =
+                    t.messages.iter().map(|(who, said)| format!("{who} said: {said}")).collect();
+                // This conversation's fact sheet — its working state.
+                if !t.facts.is_empty() {
+                    lines.push(String::new());
+                    lines.push("THIS DEAL'S FACTS (kept current by you):".into());
+                    for (k, v) in &t.facts {
+                        lines.push(format!("- {k} = {v}"));
+                    }
+                }
+                lines
+            })
             .unwrap_or_default();
         let asset_lines: Vec<String> = ctx
             .assets
             .iter()
             .map(|a| format!("- {} {}: {}", a.kind, a.name, a.qty))
             .collect();
+        let item_lines: Vec<String> = ctx
+            .items
+            .iter()
+            .map(|i| format!("- item:{} {} ({}, {})", i.id, i.name, i.kind, i.status))
+            .collect();
+        let owned_lines: Vec<String> =
+            item_lines.into_iter().chain(asset_lines.into_iter()).collect();
         let thread_state = match &ctx.thread {
             Some(t) => format!(
                 "the conversation is {} — next to speak: {}",
@@ -554,7 +588,7 @@ impl Brain for LlmBrain {
             "TASK: {title}\n{body}\n\nCONVERSATION STATUS: {thread_state}\n\nWHAT YOU OWN:\n{assets}\n\nCONVERSATION SO FAR:\n{thread}\n\nYOUR TO-DO:\n{todo}\n\nPEOPLE IN THIS WORLD (name — role, already known; do NOT re-check):\n{roster}\n\nENVIRONMENT BOARD:\n{board}",
             title = ctx.task_title,
             body = ctx.task_body,
-            assets = if asset_lines.is_empty() { "(nothing)".into() } else { asset_lines.join("\n") },
+            assets = if owned_lines.is_empty() { "(nothing)".into() } else { owned_lines.join("\n") },
             thread_state = thread_state,
             thread = if thread_lines.is_empty() { "(nothing yet — you start)".into() } else { thread_lines.join("\n") },
             todo = if todo_lines.is_empty() { "(empty)".into() } else { todo_lines.join("\n") },

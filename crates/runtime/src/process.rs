@@ -499,11 +499,24 @@ async fn think_ctx(
                     .unwrap_or_else(|| m.sender.clone());
                 view.push((who, m.body));
             }
-            Some(crate::brain::ThreadView { id: tid, status, turn, messages: view })
+            // This conversation's fact sheet — its working state.
+            let tfacts = store
+                .facts_about(agent_id, &format!("thread:{tid}"))
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|f| (f.key, f.value))
+                .collect();
+            Some(crate::brain::ThreadView { id: tid, status, turn, messages: view, facts: tfacts })
         }
         None => None,
     };
     let assets = store.assets_of(agent_id).await.unwrap_or_default();
+    // My unique things in this world — "which particular watch" lives here.
+    let items = store
+        .items_of(&env.environment_id(), agent_id)
+        .await
+        .unwrap_or_default();
     let facts: Vec<(String, String)> = store
         .facts_of(agent_id)
         .await
@@ -517,6 +530,7 @@ async fn think_ctx(
         roster,
         thread,
         assets,
+        items,
         facts,
         task_title: task_title.to_string(),
         task_body: task_body.to_string(),

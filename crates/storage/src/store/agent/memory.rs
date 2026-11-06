@@ -40,22 +40,40 @@ impl Store {
     /// meeting their minimum…"): a note that reads like one we just wrote
     /// collapses into the existing row instead of piling up. Distinct
     /// facts survive: a different first word (offered vs accepted) or a
-    /// different number ($70 vs $75) is news, never an echo.
+    /// different number ($70 vs $75) is news, never an echo. The echo
+    /// check is scoped to the same anchor — the same words about a
+    /// different thing are different memories.
     pub async fn remember(&self, agent_id: &str, kind: MemoryKind, content: &str) -> Result<i64> {
-        let (aid, kind, content) = (
+        self.remember_about(agent_id, kind, content, "").await
+    }
+
+    /// Anchored variant: `about` cites the record this memory is about
+    /// ("item:12", "thread:abc", "task:…", "ledger:4").
+    pub async fn remember_about(
+        &self,
+        agent_id: &str,
+        kind: MemoryKind,
+        content: &str,
+        about: &str,
+    ) -> Result<i64> {
+        let (aid, kind, content, about) = (
             agent_id.to_string(),
             kind.as_str().to_string(),
             content.to_string(),
+            about.to_string(),
         );
         self.db
             .exec(move |c| {
-                // The recent window this note could be an echo of.
+                // The recent window this note could be an echo of — same
+                // anchor only.
                 let recent: Vec<(i64, String)> = {
                     let mut stmt = c.prepare(
                         "SELECT id, content FROM agent_memory \
-                         WHERE agent_id = ?1 ORDER BY id DESC LIMIT 8",
+                         WHERE agent_id = ?1 AND about = ?2 ORDER BY id DESC LIMIT 8",
                     )?;
-                    let rows = stmt.query_map(params![aid], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                    let rows = stmt.query_map(params![aid, about], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?;
                     rows.collect::<rusqlite::Result<Vec<_>>>()?
                 };
                 let want = EchoFingerprint::of(&content);
@@ -65,9 +83,9 @@ impl Store {
                     }
                 }
                 c.execute(
-                    "INSERT INTO agent_memory (agent_id, kind, content, created_at) \
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![aid, kind, content, now_ms()],
+                    "INSERT INTO agent_memory (agent_id, kind, content, about, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![aid, kind, content, about, now_ms()],
                 )?;
                 Ok(c.last_insert_rowid())
             })

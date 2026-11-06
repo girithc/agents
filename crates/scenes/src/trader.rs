@@ -1,12 +1,14 @@
-//! Trader scene: one buyer, one seller, one item — a thin implementation
-//! of the base. The world runs through **conversation**: the buyer finds
-//! the seller on the roster, approaches them (`talk_to`), they negotiate,
-//! and `send_offer`/`accept_deal` are the binding handshake both sides
-//! must use to close (the ledger is the truth).
+//! Trader scene: one buyer, one seller, TWO watches — a thin
+//! implementation of the base. The world runs through **conversation**:
+//! the buyer finds the seller on the roster, approaches them (`talk_to`),
+//! compares the watches, they negotiate, and `send_offer`/`accept_deal`
+//! are the binding handshake both sides must use to close (the ledger is
+//! the truth).
 //!
-//! Ownership is private: the seller *possesses* the watch (its soul and
-//! memory carry that), and the buyer's budget lives only in the buyer.
-//! The board is a projection for **human auditing** of item status —
+//! Possession and constraints are DATA, never prose: the watches live in
+//! the environment item registry (serial-numbered, owner field), the
+//! seller's floors and the buyer's budget are anchored facts. Souls are
+//! character only. The board is a projection for **human auditing** —
 //! never read by agents, never announced to them.
 
 use std::sync::Arc;
@@ -17,16 +19,14 @@ use agenthub_storage::{NewAgent, Store};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-/// The item this world trades. Public so tests and humans can reference it;
-/// agents know it from their souls, never from a board.
-pub const ITEM: &str = "watch";
 const BUYER: &str = "buyer";
 const SELLER: &str = "seller";
 
 // ---------------------------------------------------------------- tools
 
-/// `send_offer(to, item, price)` — counter or open. Enqueues a response
-/// task on the counterpart's queue, flips the item to pending, ledgers it.
+/// `send_offer(item, price)` — the formal offer for a PARTICULAR item
+/// (its id routes the offer to the owner). Ledgers it, marks the item
+/// pending; the words ride talk_to in the same breath.
 pub struct SendOffer;
 
 #[async_trait]
@@ -34,16 +34,16 @@ impl Tool for SendOffer {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "send_offer".into(),
-            description: "Make or counter an offer to another agent for an item."
+            description: "Make or counter a formal offer for a particular item \
+                          (by its item:<id>). The owner is resolved for you."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "to":    { "type": "string", "description": "agent name" },
-                    "item":  { "type": "string" },
+                    "item":  { "type": "string", "description": "item:<id> — WHICH particular thing" },
                     "price": { "type": "number" }
                 },
-                "required": ["to", "item", "price"]
+                "required": ["item", "price"]
             }),
         }
     }
@@ -51,41 +51,52 @@ impl Tool for SendOffer {
     fn describe(&self, result: &Value) -> String {
         let err = result.get("error").and_then(Value::as_str)
             .map(|e| format!(" (failed: {e})")).unwrap_or_default();
-        format!("offered ${:.0}{err}", result.get("offered").and_then(Value::as_f64).unwrap_or(0.0))
+        format!(
+            "offered ${:.0} for {}{err}",
+            result.get("offered").and_then(Value::as_f64).unwrap_or(0.0),
+            result.get("item").and_then(Value::as_str).unwrap_or("an item"),
+        )
     }
 
     async fn call(&self, args: &Value, ctx: &AgentTools) -> Result<Value, String> {
-        let to = args.get("to").and_then(Value::as_str).ok_or("missing 'to'")?;
-        let item = args.get("item").and_then(Value::as_str).ok_or("missing 'item'")?;
+        let item = args.get("item").and_then(Value::as_str).ok_or("missing 'item' (item:<id>)?")?;
         let price = args.get("price").and_then(Value::as_f64).ok_or("missing 'price'")?;
         if !price.is_finite() || price <= 0.0 {
             return Err(format!("invalid price {price}"));
         }
-        // Items are private (souls + memory), not board facts — no
-        // existence check; ownership is trust + house rules.
-        let to_agent = ctx
+        // The item's identity routes the offer to its owner.
+        let owner = ctx
             .store()
-            .get_agent(to)
+            .item_owner(item)
             .await
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("no agent '{to}'"))?;
+            .ok_or_else(|| format!("no item '{item}'"))?
+            .ok_or_else(|| format!("item '{item}' is unowned — nothing to negotiate against"))?;
+        if owner == ctx.agent_id() {
+            return Err("that item is yours — you cannot offer yourself".into());
+        }
 
         let payload = json!({
-            "item": item, "from": ctx.agent_id(), "to": to_agent.id, "price": price
+            "item": item, "from": ctx.agent_id(), "to": owner, "price": price
         });
         ctx.store()
             .append_change(&ctx.env().environment_id().to_string(), Some(ctx.agent_id()), "offer_made", &payload.to_string())
             .await
             .map_err(|e| e.to_string())?;
+        ctx.store()
+            .set_item_status(item, "pending")
+            .await
+            .map_err(|e| e.to_string())?;
 
         // Fact only: the ledger row. The words ride talk_to in the same
         // breath — one conversation, no duplicate words or task rows.
-        Ok(json!({ "ok": true, "offered": price }))
+        Ok(json!({ "ok": true, "offered": price, "item": item }))
     }
 }
 
-/// `accept_deal(with, item, price)` — close the deal: ledger row, item
-/// sold, both sides' queues settle.
+/// `accept_deal(item, price, i_give)` — close the deal on a PARTICULAR
+/// item: money and ownership move in one atomic transaction, one ledger
+/// row, item marked sold.
 pub struct AcceptDeal;
 
 #[async_trait]
@@ -93,15 +104,17 @@ impl Tool for AcceptDeal {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "accept_deal".into(),
-            description: "Accept a price with another agent and close the deal.".into(),
+            description: "Accept a price with another agent and close the deal on a \
+                          particular item (by its item:<id>)."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "with":   { "type": "string", "description": "counterpart agent name" },
-                    "item":   { "type": "string" },
+                    "item":   { "type": "string", "description": "item:<id> — WHICH particular thing" },
                     "price":  { "type": "number" },
                     "i_give": { "type": "string", "enum": ["money", "item"],
-                                "description": "what YOU hand over: money (you're buying) or item (you're selling) — per your own soul" }
+                                "description": "what YOU hand over: money (you're buying) or item (you're selling) — per your own facts" }
                 },
                 "required": ["with", "item", "price", "i_give"]
             }),
@@ -116,7 +129,7 @@ impl Tool for AcceptDeal {
 
     async fn call(&self, args: &Value, ctx: &AgentTools) -> Result<Value, String> {
         let with = args.get("with").and_then(Value::as_str).ok_or("missing 'with'")?;
-        let item = args.get("item").and_then(Value::as_str).ok_or("missing 'item'")?;
+        let item = args.get("item").and_then(Value::as_str).ok_or("missing 'item' (item:<id>)?")?;
         let price = args.get("price").and_then(Value::as_f64).ok_or("missing 'price'")?;
         if !price.is_finite() || price <= 0.0 {
             return Err(format!("invalid price {price}"));
@@ -128,38 +141,43 @@ impl Tool for AcceptDeal {
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("no agent '{with}'"))?;
 
-        // THE transfer, atomically (base primitive). The tool is STATELESS:
-        // the caller declares what THEY give (their soul knows who they
-        // are); the counterpart gives the complement. Nothing is inferred.
+        // THE transfer, atomically (base primitive). The caller declares
+        // what THEY give; the item flips ownership in the same
+        // transaction as the money, and only if it's where expected.
         let i_give = args.get("i_give").and_then(Value::as_str).ok_or("missing 'i_give' (money or item)?")?;
-        let (i_give_kind, i_give_name, i_give_qty, their_kind, their_name, their_qty) = match i_give {
-            "money" => ("money", "usd", price, "item", item, 1.0),
-            "item" => ("item", item, 1.0, "money", "usd", price),
+        let nothing = || agenthub_storage::store::agent::AssetGive {
+            agent_id: String::new(),
+            kind: "nothing".into(),
+            name: "nothing".into(),
+            qty: 0.0,
+        };
+        let item_owner = match i_give {
+            // I pay → the item is currently THEIRS.
+            "money" => other.id.clone(),
+            // I sell → the item is currently MINE.
+            "item" => ctx.agent_id().to_string(),
             other => return Err(format!("i_give must be 'money' or 'item', got '{other}'")),
         };
-        let my_give = agenthub_storage::store::agent::AssetGive {
-            agent_id: ctx.agent_id().to_string(),
-            kind: i_give_kind.into(),
-            name: i_give_name.into(),
-            qty: i_give_qty,
+        let a_give = if i_give == "money" {
+            agenthub_storage::store::agent::AssetGive {
+                agent_id: ctx.agent_id().to_string(),
+                kind: "money".into(),
+                name: "usd".into(),
+                qty: price,
+            }
+        } else {
+            nothing()
         };
-        let their_give = agenthub_storage::store::agent::AssetGive {
-            agent_id: other.id.clone(),
-            kind: their_kind.into(),
-            name: their_name.into(),
-            qty: their_qty,
+        let b_give = if i_give == "item" {
+            agenthub_storage::store::agent::AssetGive {
+                agent_id: other.id.clone(),
+                kind: "money".into(),
+                name: "usd".into(),
+                qty: price,
+            }
+        } else {
+            nothing()
         };
-        // Idempotence guard: if the watch already sold, refuse — a repeated
-        // accept_deal must not run the trade backwards.
-        let already_sold = ctx
-            .env()
-            .board_get(&format!("item:{item}"))
-            .await
-            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(|s| s == "sold"))
-            .unwrap_or(false);
-        if already_sold {
-            return Err(format!("the {item} is already sold — nothing to accept"));
-        }
         let payload = json!({
             "item": item, "party_a": ctx.agent_id(), "party_b": other.id, "price": price
         });
@@ -169,20 +187,21 @@ impl Tool for AcceptDeal {
                 Some(ctx.agent_id()),
                 "deal",
                 &payload.to_string(),
-                my_give,
-                their_give,
+                a_give,
+                b_give,
+                Some((item, item_owner.as_str())),
             )
             .await
             .map_err(|e| e.to_string())?;
 
         // Board projection (human audit only).
         ctx.env()
-            .set_board(&format!("item:{item}"), &json!({ "status": "sold", "last_price": price }))
+            .set_board(item, &json!({ "status": "sold", "last_price": price }))
             .await;
 
         // The thread's lifecycle is the AGENTS' choice (close_thread /
         // leave_thread) — the deal is a fact, not a conversation-ender.
-        Ok(json!({ "ok": true, "deal_price": price }))
+        Ok(json!({ "ok": true, "deal_price": price, "item": item }))
     }
 }
 
@@ -217,41 +236,51 @@ impl Scene for TraderScene {
             .await
             .map_err(|e| e.to_string())?;
 
-        // Roster: souls carry the private facts (who owns what, budget,
-        // floor). Nothing is placed on the public board — the seller owns
-        // the watch, the buyer wants one, and they find each other through
-        // the roster and conversation.
+        // Souls: character ONLY — no possession, no numbers. Those are
+        // data now (items + facts below).
         let buyer = agent(
             store,
             BUYER,
             "buyer",
-            "You are a buyer. You want to buy a watch. You have a budget of $100 — \
-             get it as cheap as possible, but a fair deal today beats no deal. \
-             Check who_is_here, find someone who sells, and approach them with \
-             talk_to: greet them, ask what they have, negotiate. Close with the \
-             send_offer/accept_deal handshake.",
+            "You are a buyer who values quality and a fair price. Your budget \
+             lives in your facts — never exceed it. There may be several \
+             things worth buying; ask, compare, and choose deliberately. \
+             Find sellers via who_is_here, approach with talk_to: greet, ask \
+             what they have, negotiate. Close with the send_offer/\
+             accept_deal handshake, and keep your facts current as deals move.",
         )
         .await?;
         let seller = agent(
             store,
             SELLER,
             "seller",
-            "You are a seller. You own a watch — remember it; it is yours to sell. \
-             You must clear at least $70, squeeze the best price, and close today. \
-             Entertain buyers who approach you (talk_to). If no one approaches, go \
-             look for buyers: check who_is_here and approach them with a pitch. \
-             Close with the send_offer/accept_deal handshake.",
+            "You are a seller — you make your living moving stock at good \
+             prices. Your floors live in your facts, anchored per item: \
+             never sell below them. Entertain buyers who approach you \
+             (talk_to); if no one approaches, go look for buyers: check \
+             who_is_here and pitch. Close with the send_offer/accept_deal \
+             handshake, and keep your facts current as deals move.",
         )
         .await?;
 
-        // Ownership, as base asset rows (the REAL state): the buyer holds
-        // $100, the seller holds the watch. Souls describe it; rows prove it.
-        store
-            .adjust_asset(&buyer, "money", "usd", 100.0)
+        // Data seeds: the world's stock and the private mandates.
+        let watch_a = store
+            .mint_item(&env.id, "item", "watch", Some(&seller))
             .await
             .map_err(|e| e.to_string())?;
+        let watch_b = store
+            .mint_item(&env.id, "item", "watch", Some(&seller))
+            .await
+            .map_err(|e| e.to_string())?;
+        // The seller's mandates — private, anchored per item.
+        store.fact_put(&seller, "floor", "$70", &format!("item:{watch_a}")).await.map_err(|e| e.to_string())?;
+        store.fact_put(&seller, "floor", "$65", &format!("item:{watch_b}")).await.map_err(|e| e.to_string())?;
+        store.fact_put(&seller, "target", "$90", &format!("item:{watch_a}")).await.map_err(|e| e.to_string())?;
+        // The buyer's constraint — private.
+        store.fact_put(&buyer, "budget", "$100", "").await.map_err(|e| e.to_string())?;
+        // Money: the only fungible.
         store
-            .adjust_asset(&seller, "item", ITEM, 1.0)
+            .adjust_asset(&buyer, "money", "usd", 100.0)
             .await
             .map_err(|e| e.to_string())?;
 

@@ -16,6 +16,7 @@ pub use models::{
     Agent, AgentUpdate, AgentVersion, Feedback, FeedbackSummary, NewAgent, SecretMeta, TraceEvent,
     TraceSpan,
 };
+pub use store::environment::Item;
 pub use store::Store;
 pub use vault::Vault;
 

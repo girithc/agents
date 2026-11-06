@@ -94,6 +94,10 @@ impl Store {
     /// THE exchange: `a` gives `a_give` to `b`, `b` gives `b_give` to `a`,
     /// atomically. One ledger row records the world mutation. If either
     /// side can't afford their part, NOTHING moves and the error names it.
+    /// For trades involving a UNIQUE item, pass
+    /// `item = (item_id, current_owner)` — ownership flips to the other
+    /// party inside the same transaction (the whole trade fails if the
+    /// item isn't where expected or is already sold).
     pub async fn exchange(
         &self,
         environment_id: &str,
@@ -102,6 +106,7 @@ impl Store {
         payload: &str,
         a_give: AssetGive,
         b_give: AssetGive,
+        item: Option<(&str, &str)>,
     ) -> Result<()> {
         let (eid, actor, lkind, payload) = (
             environment_id.to_string(),
@@ -109,6 +114,7 @@ impl Store {
             ledger_kind.to_string(),
             payload.to_string(),
         );
+        let item: Option<(String, String)> = item.map(|(i, o)| (i.to_string(), o.to_string()));
         self.db
             .exec_any(move |c| {
                 // One SQLite transaction: all checks + moves, or none.
@@ -151,6 +157,25 @@ impl Store {
                         params![receiver, g_kind, g_name, cur_r + g_qty],
                     )?;
                 }
+                // The unique thing changes hands — same transaction, so a
+                // failed item flip aborts the money too.
+                if let Some((item_id, current_owner)) = &item {
+                    let to = if *current_owner == a_give.agent_id {
+                        &b_give.agent_id
+                    } else {
+                        &a_give.agent_id
+                    };
+                    let n = c.execute(
+                        "UPDATE environment_items SET owner = ?2, status = 'sold', updated_at = ?3 \
+                         WHERE id = ?1 AND owner = ?4 AND status != 'sold'",
+                        params![item_id, to, now_ms(), current_owner],
+                    )?;
+                    if n != 1 {
+                        return Err(StorageError::Insufficient(format!(
+                            "item {item_id} is not transferable from '{current_owner}' (already sold, or not the owner)"
+                        )));
+                    }
+                }
                 c.execute(
                     "INSERT INTO environment_changes (environment_id, actor, kind, payload, created_at) \
                      VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -185,6 +210,7 @@ mod tests {
             r#"{"price":85}"#,
             AssetGive { agent_id: "buyer".into(), kind: "money".into(), name: "usd".into(), qty: 85.0 },
             AssetGive { agent_id: "seller".into(), kind: "item".into(), name: "watch".into(), qty: 1.0 },
+            None,
         ).await.unwrap();
 
         let b = s.assets_of("buyer").await.unwrap();
@@ -210,6 +236,7 @@ mod tests {
             &env.id, Some("broke-buyer"), "deal", "{}",
             AssetGive { agent_id: "broke-buyer".into(), kind: "money".into(), name: "usd".into(), qty: 85.0 },
             AssetGive { agent_id: "seller".into(), kind: "item".into(), name: "watch".into(), qty: 1.0 },
+            None,
         ).await;
 
         assert!(err.is_err(), "unaffordable exchange must fail");

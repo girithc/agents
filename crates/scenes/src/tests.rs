@@ -38,9 +38,9 @@ async fn scene_setup_is_complete() {
     let specs: Vec<_> = scene.domain_tools().iter().map(|t| t.spec().name).collect();
     assert_eq!(specs, vec!["send_offer", "accept_deal"]);
 
-    // Nothing is public at setup: no item on the board (the seller owns
-    // it privately), no seeded tasks (the roster + souls drive first
-    // contact), and the roster carries name + role only.
+    // Nothing is public at setup: no item on the board (items live in the
+    // world registry, private reads), no seeded tasks (the roster + souls
+    // drive first contact), and the roster carries name + role only.
     assert_eq!(world.env.board_get("item:watch").await, None);
     // The handshake law must be on the books (rules evolve; the count
     // itself isn't the contract).
@@ -58,6 +58,20 @@ async fn scene_setup_is_complete() {
         .collect();
     assert!(roster.contains(&("buyer".into(), "buyer".into())));
     assert!(roster.contains(&("seller".into(), "seller".into())));
+
+    // The world's stock: TWO individual watches, both owned by the seller
+    // — identity, not counted inventory.
+    let seller_id = world.agents[1].clone();
+    let items = s.items_of(&world.env.environment_id(), &seller_id).await.unwrap();
+    assert_eq!(items.len(), 2, "the seller holds two individual watches");
+    assert!(items.iter().all(|i| i.name == "watch" && i.owner.as_deref() == Some(seller_id.as_str())));
+    assert!(items.iter().all(|i| i.status == "available"));
+
+    // The mandates are facts (data), not soul prose: per-item floors, buyer budget.
+    let floors = s.facts_about(&seller_id, &format!("item:{}", items[0].id)).await.unwrap();
+    assert!(floors.iter().any(|f| f.key == "floor"));
+    let budget = s.facts_of(&world.agents[0]).await.unwrap();
+    assert!(budget.iter().any(|f| f.key == "budget"));
 }
 
 /// Live multi-agent negotiation: buyer (budget $100) vs seller (floor $70).

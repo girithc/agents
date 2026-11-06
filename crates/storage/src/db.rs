@@ -144,6 +144,7 @@ CREATE TABLE IF NOT EXISTS agent_memory (
     agent_id   TEXT NOT NULL,
     kind       TEXT NOT NULL DEFAULT 'event',
     content    TEXT NOT NULL,
+    about      TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agent_memory_agent ON agent_memory(agent_id);
@@ -151,13 +152,33 @@ CREATE INDEX IF NOT EXISTS idx_agent_memory_agent ON agent_memory(agent_id);
 -- Semantic memory: keyed facts the agent keeps CURRENT (upsert, never
 -- append) — "my offer: $75", "the seller's floor: $70". Always pushed
 -- into the agent's think prompt; the agent edits them with fact tools.
+-- `about` anchors the fact to a record ("item:12", "thread:abc") — the
+-- same key can exist per thing; '' = the agent itself.
 CREATE TABLE IF NOT EXISTS agent_facts (
     agent_id   TEXT NOT NULL,
     key        TEXT NOT NULL,
     value      TEXT NOT NULL DEFAULT '',
-    updated_at INTEGER NOT NULL,
-    PRIMARY KEY (agent_id, key)
+    about      TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_facts_key ON agent_facts(agent_id, key, about);
+
+-- The world's registry of UNIQUE things (watches, lamps, tools): one row
+-- per individual, ownership as a field. Fungibles (money) stay in
+-- agent_assets as quantities. NOT a public ledger: only the owner reads
+-- their rows; transfers are audited via environment_changes.
+CREATE TABLE IF NOT EXISTS environment_items (
+    id             TEXT PRIMARY KEY,
+    environment_id TEXT NOT NULL,
+    kind           TEXT NOT NULL DEFAULT 'item',
+    name           TEXT NOT NULL,
+    owner          TEXT,
+    status         TEXT NOT NULL DEFAULT 'available',
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_env_items_env ON environment_items(environment_id);
+CREATE INDEX IF NOT EXISTS idx_env_items_owner ON environment_items(owner);
 
 CREATE TABLE IF NOT EXISTS tools (
     id         TEXT PRIMARY KEY,
@@ -275,6 +296,42 @@ impl Db {
         drop(stmt);
         if !cols.iter().any(|c| c == "thread_id") {
             conn.execute_batch("ALTER TABLE agent_tasks ADD COLUMN thread_id TEXT")?;
+        }
+        Self::migrate_about_columns(conn)?;
+        Ok(())
+    }
+
+    /// Memory gained record-anchors (`about` = "item:12" / "thread:abc").
+    /// For `agent_facts` the key changed too — old PK (agent_id, key)
+    /// blocks per-thing facts — so the table is rebuilt when pre-anchor.
+    fn migrate_about_columns(conn: &Connection) -> Result<()> {
+        for table in ["agent_memory", "agent_facts"] {
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            if cols.iter().any(|c| c == "about") {
+                continue;
+            }
+            if table == "agent_memory" {
+                conn.execute_batch("ALTER TABLE agent_memory ADD COLUMN about TEXT NOT NULL DEFAULT ''")?;
+            } else {
+                conn.execute_batch(
+                    "CREATE TABLE agent_facts_new (
+                        agent_id   TEXT NOT NULL,
+                        key        TEXT NOT NULL,
+                        value      TEXT NOT NULL DEFAULT '',
+                        about      TEXT NOT NULL DEFAULT '',
+                        updated_at INTEGER NOT NULL
+                    );
+                    INSERT INTO agent_facts_new SELECT agent_id, key, value, '', updated_at FROM agent_facts;
+                    DROP TABLE agent_facts;
+                    ALTER TABLE agent_facts_new RENAME TO agent_facts;
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_facts_key
+                        ON agent_facts(agent_id, key, about);",
+                )?;
+            }
         }
         Ok(())
     }

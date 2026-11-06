@@ -17,6 +17,9 @@ pub struct ThreadView {
     pub turn: Option<String>,
     /// The transcript so far: (sender name, words), oldest first.
     pub messages: Vec<(String, String)>,
+    /// THIS conversation's fact sheet — the working state of this deal
+    /// (my_offer, their_ask, round...), kept current by the agent.
+    pub facts: Vec<(String, String)>,
 }
 
 pub struct ThinkCtx {
@@ -32,6 +35,9 @@ pub struct ThinkCtx {
     pub thread: Option<ThreadView>,
     /// What I own (money, items) — mine only, never others'.
     pub assets: Vec<agenthub_storage::store::agent::Asset>,
+    /// The unique things I own in this world (serial-numbered rows) —
+    /// "which particular watch" lives here.
+    pub items: Vec<agenthub_storage::Item>,
     /// What I know (keyed facts, always current) — pushed, never re-polled.
     pub facts: Vec<(String, String)>,
     /// Title/body of the popped task, or the incoming message that woke it.
@@ -131,8 +137,15 @@ impl AgentTools {
         &self,
         kind: agenthub_storage::store::agent::MemoryKind,
         content: &str,
+        about: Option<&str>,
     ) {
-        let _ = self.store.remember(&self.agent_id, kind, content).await;
+        // Anchor resolution: the model's explicit anchor ("item:12") wins,
+        // else the conversation we're in, else the agent itself.
+        let scope = about
+            .map(|s| s.to_string())
+            .or_else(|| self.thread_scope())
+            .unwrap_or_default();
+        let _ = self.store.remember_about(&self.agent_id, kind, content, &scope).await;
     }
 
     pub async fn recall(&self, query: &str, limit: i64) -> Vec<agenthub_storage::store::agent::MemoryRow> {
@@ -452,14 +465,34 @@ impl AgentTools {
     }
 
     /// Set a fact — create or overwrite. This is how state changes: an
-    /// update to a key, never a new diary line.
-    pub async fn fact_put(&self, key: &str, value: &str) {
-        let _ = self.store.fact_put(&self.agent_id, key, value).await;
+    /// update to a key, never a new diary line. Scoped: the model's
+    /// explicit anchor ("item:12") wins, else the current conversation,
+    /// else the agent itself.
+    pub async fn fact_put(&self, key: &str, value: &str, about: Option<&str>) {
+        let scope = about
+            .map(|s| s.to_string())
+            .or_else(|| self.thread_scope())
+            .unwrap_or_default();
+        let _ = self.store.fact_put(&self.agent_id, key, value, &scope).await;
     }
 
     /// Drop a fact — it's no longer true or no longer mine to track.
-    pub async fn fact_forget(&self, key: &str) {
-        let _ = self.store.fact_forget(&self.agent_id, key).await;
+    pub async fn fact_forget(&self, key: &str, about: Option<&str>) {
+        let scope = about
+            .map(|s| s.to_string())
+            .or_else(|| self.thread_scope())
+            .unwrap_or_default();
+        let _ = self.store.fact_forget(&self.agent_id, key, &scope).await;
+    }
+
+    /// "thread:{id}" when this think runs inside a conversation — the
+    /// automatic anchor for facts and memories written mid-talk.
+    fn thread_scope(&self) -> Option<String> {
+        self.current_thread
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(tid, _)| format!("thread:{tid}"))
     }
 }
 

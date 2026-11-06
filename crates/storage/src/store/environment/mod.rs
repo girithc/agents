@@ -2,10 +2,12 @@
 //! All environment-pertaining tables live in this subfolder.
 
 mod changes;
+mod items;
 mod rules;
 mod state;
 
 pub use changes::EnvChange;
+pub use items::Item;
 pub use rules::EnvRule;
 pub use state::EnvStateRow;
 
